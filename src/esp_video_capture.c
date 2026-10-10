@@ -199,7 +199,7 @@ void camera_capture_individual_task(void *pvParameters)
             }
                 
             cnt++;
-            if(cnt%fps == 0)
+            if(cnt%(10*fps) == 0)
                 ESP_LOGI(TAG, "Frame captured in %d ms, len %d, speed %dfps", pdTICKS_TO_MS(xTaskGetTickCount() - start_time), shared_frame_len, fps);
             video_capture_release_frame(&cap, fb);
         }
