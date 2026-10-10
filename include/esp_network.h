@@ -15,7 +15,6 @@
 #include "lwip/sockets.h"
 #include "esp_netif_types.h"
 #include "esp_http_server.h"
-//#include "ip4_addr.h"
 
 // ----- CẤU HÌNH THÔNG SỐ WI-FI & PORT -----
 #define WIFI_SSID             "V29"
@@ -30,10 +29,15 @@
 
 #define PART_BOUNDARY       "123456789000000000000987654321"
 
-#define ALLOWED_MAC_STR     "4c:03:4f:db:2f:27"
+#define WIFI_SSID_ACESS     "LT29"
+#define WIFI_PASS_ACESS     "vcld1876317"
+#define SERVER_PORT_ACCESS   1357
+#define AUTH_PASSWORD       "pass187631\n" 
 
 
 void wifi_init_softap(void);
+void wifi_init_sta(void);
 void start_host_web_server(void *pvParameters);
+void video_stream_task(void *pvParameters);
 
 #endif

@@ -59,11 +59,11 @@ bool camera_init(esp_video_capture_t* cap)
     // Cấu hình định dạng và nén bằng phần cứng
     cap->config.pixel_format   = PIXFORMAT_JPEG;
     cap->config.frame_size     = FRAMESIZE_VGA;       // 1280x720
-    cap->config.jpeg_quality   = 15;                 // Tối ưu cân bằng dung lượng/băng thông mạng
+    cap->config.jpeg_quality   = 16;                 // Tối ưu cân bằng dung lượng/băng thông mạng
     
     // Chiến lược quản lý Bộ đệm DMA nâng cao trên PSRAM
     cap->config.fb_location    = CAMERA_FB_IN_PSRAM; // Ép buộc lưu trên PSRAM
-    cap->config.fb_count       = 2;                  // Bật chế độ Ping-Pong DMA
+    cap->config.fb_count       = 1;                  // Bật chế độ Ping-Pong DMA
     cap->config.grab_mode      = CAMERA_GRAB_LATEST;  // CHỈ LẤY KHUNG HÌNH MỚI NHẤT, vứt bỏ khung hình lỗi mất EOI
 
     // Khởi tạo driver camera phần cứng (Kích hoạt EDMA/LCD_CAM DMA)
@@ -73,48 +73,58 @@ bool camera_init(esp_video_capture_t* cap)
         cap->is_opened = false;
         return false;
     }
-sensor_t *s = esp_camera_sensor_get();
-if (s != NULL) {
-    // --- BƯỚC 1: ĐỊNH CẤU HÌNH CROP PHẦN CỨNG ---
-    s->set_res_raw(s, 1, 0, 0, 0, 0, 0, 800, 600, 640, 480, false, false);
-
-    // --- BƯỚC 2: TẮT CHẾ ĐỘ GIẢM FPS TỰ ĐỘNG THIẾU SÁNG ---
-    s->set_reg(s, 0xff, 0xff, 0x01); // Vào Bank 1
-    s->set_reg(s, 0x2d, 0xff, 0x00); // Khóa tính năng tự động drop FPS khi tối
-    s->set_reg(s, 0x2e, 0xff, 0x00); 
-
-  // --- BƯỚC 3: TẮT MÀN HÌNH TRẬP TỰ ĐỘNG (BẮT BUỘC) ---
-    s->set_exposure_ctrl(s, 0);       
-
-    // --- BƯỚC 4: TĂNG MẠNH GIÁ TRỊ PHƠI SÁNG THỦ CÔNG (MANUAL EXP) ---
-    s->set_reg(s, 0xff, 0xff, 0x01); // Đảm bảo ở Bank 1
     
-    // Tăng giá trị phơi sáng (AEC) lên mức cao để cảm biến kịp ăn sáng trong phòng
-    s->set_reg(s, 0x04, 0xff, 0x03); // Tăng bit cao (AEC[15:10])
-    s->set_reg(s, 0x10, 0xff, 0xff); // Đẩy bit trung tâm (AEC[9:2]) lên tối đa (0xFF)
-    s->set_reg(s, 0x45, 0xff, 0xff); // Đẩy bit thấp (AEC[1:0]) lên tối đa
+   sensor_t *s = esp_camera_sensor_get();
+    if (s != NULL) {
+        // --- 1. GIỮ NGUYÊN CẤU HÌNH RAW VGA THEO YÊU CẦU CỦA BẠN ---
+        s->set_res_raw(s, 1, 0, 0, 0, 0, 0, 800, 600, 640, 480, false, false);
 
-    // --- BƯỚC 5: ĐIỀU CHỈNH GAIN (ĐỘ KHUẾCH ĐẠI ĐIỆN TỬ) ĐỂ GIẢM SỌC ---
-    // Do tắt AEC, ta nên thử tắt cả AGC (Tự động Gain) và đặt Gain cố định 
-    // để triệt tiêu hiện tượng sọc ngang tự động nhảy trên màn hình.
-    s->set_gain_ctrl(s, 0);           // Tắt tự động tăng Gain (AGC = 0)
-    
-    // Đặt giá trị Gain thủ công (Thanh ghi 0x00 ở Bank 1)
-    // Giá trị từ 0x00 đến 0x3F. Thử mức trung bình-cao 0x20 để ảnh sáng mà ít nhiễu sọc.
-    s->set_reg(s, 0x00, 0xff, 0x20); 
+        // --- 2. GIỮ CẤU HÌNH ĐỘ SÁNG VÀ MÀU SẮC ĐÃ CHUẨN ---
+        s->set_brightness(s, 2);     // Giữ độ sáng phần mềm tối đa (+2) để bù đắp cho chuyển động nhanh
+        s->set_contrast(s, 1);       
+        s->set_saturation(s, 2);     
+        s->set_special_effect(s, 0); 
 
-    // --- BƯỚC 6: GIỮ CÂN BẰNG TRẮNG VÀ BỘ LỌC NHIỄU ĐIỂM ---
-    s->set_whitebal(s, 1);       
-    s->set_awb_gain(s, 1);       
-    s->set_dcw(s, 1);             
-    s->set_lenc(s, 1);            
-    s->set_bpc(s, 1);                
-    s->set_wpc(s, 1);                
-    s->set_brightness(s, 1);         // Tăng nhẹ độ sáng kỹ thuật số phần mềm lên +2
+        s->set_whitebal(s, 1);       
+        s->set_awb_gain(s, 1);       
+        s->set_wb_mode(s, 0);        
 
-    vTaskDelay(pdMS_TO_TICKS(1200)); 
-    ESP_LOGI(TAG, "Auto-Exposure (AEC) Disabled. Shutter speed forced to manual fast mode.");
-}
+        // --- 3. BÍ QUYẾT TRIỆT TIÊU LAG KHI CHUYỂN ĐỘNG NHANH CHO RAW VGA ---
+        s->set_reg(s, 0xff, 0xff, 0x00); // Vào Bank 0 để chỉnh luồng DSP
+        // Đẩy bộ chia xung nhịp PCLK lên mức tối đa (0x1F) để kéo giãn thời gian truyền tải pixel. 
+        // Điều này giúp bộ đệm PSRAM không bao giờ bị nghẽn mạch kể cả khi bạn quơ tay thật nhanh.
+        s->set_reg(s, 0xd3, 0xff, 0x1F); // [ĐẨY LÊN MỨC TRẦN TỐI ĐA 0x1F]
+
+        // --- 4. GIỮ TỰ ĐỘNG PHƠI SÁNG (AEC) CHỐNG SỌC ĐÈN ĐIỆN 50HZ ---
+        s->set_exposure_ctrl(s, 1);  // Bật tự động đo sáng
+        s->set_aec2(s, 0);           // Đảm bảo tắt AEC2 để giải phóng dung lượng RAM xử lý cho chip
+        s->set_ae_level(s, 0);       // Đưa ae_level về 0 để chip không bị ép mở màn trập quá lâu khi di chuyển nhanh
+
+        s->set_reg(s, 0xff, 0xff, 0x01); // Vào Bank 1
+        s->set_reg(s, 0x11, 0xff, 0x01); // Giữ tỷ lệ phân tần nội bộ mượt với bộ đệm
+        s->set_reg(s, 0x3d, 0x03, 0x01); // Bộ lọc tần số quét vật lý 50Hz phần cứng chống sọc đèn phòng
+        
+        // Ép ma trận đo sáng tự động của cảm biến sang chế độ ưu tiên tốc độ quét khung hình tuyệt đối
+        s->set_reg(s, 0x13, 0xff, 0x07); // [ĐỔI TỪ 0xC7 VỀ 0x07]: Cấu hình ép chip ngắt phơi sáng dài khi phát hiện biến động chuyển động nhanh
+
+        // --- 5. GIỮ ĐỘ LỢI SÁNG ĐỂ ẢNH MỊN, HẠN CHẾ SỌC NHIỄU ---
+        s->set_gain_ctrl(s, 1);      
+        s->set_gainceiling(s, (gainceiling_t)2); // Giữ trần khuếch đại ở mức GAINCEILING_8X chống sọc nhiễu mảnh
+
+        // --- 6. GIỮ CÁC BỘ LỌC HOÀN THIỆN VÀ CHIỀU XOAY ẢNH CHUẨN ---
+        s->set_bpc(s, 1);            
+        s->set_wpc(s, 1);            
+        s->set_raw_gma(s, 1);        
+        s->set_lenc(s, 1);           
+        s->set_dcw(s, 1);            
+        s->set_colorbar(s, 0);       
+
+        s->set_hmirror(s, 1);        
+        s->set_vflip(s, 1);          
+
+        vTaskDelay(pdMS_TO_TICKS(1500)); 
+    }
+
     ESP_LOGI(TAG, "Camera initialization is sucessfull (Resolution: HD, Storge: PSRAM)");
     cap->is_opened = true;
     return true;
@@ -165,7 +175,9 @@ void camera_capture_individual_task(void *pvParameters)
     camera_fb_t *fb = NULL;
     ESP_LOGI("CAM_TASK", "Individual Capture Task start working at Core 0.");
     TickType_t start_time = 0;
-    int cnt = 0;
+    uint16_t cnt = 0;
+    uint16_t max_len = 0;
+    uint16_t retry = 0;
     while (1) 
     {
         start_time = xTaskGetTickCount();
@@ -173,22 +185,27 @@ void camera_capture_individual_task(void *pvParameters)
         // 1. Chờ và lấy khung hình từ DMA hoán đổi tự động
         if (video_capture_read(&cap, &fb))
         {
-            if(shared_frame_buf == NULL || (uint16_t)(shared_frame_len*1.1) < fb->len)
+            if(shared_frame_buf == NULL || max_len < fb->len)
             {
-                uint8_t* tmp = realloc(shared_frame_buf, (uint16_t)(fb->len*1.1));
+                max_len = fb->len;
+                uint8_t* tmp = realloc(shared_frame_buf, max_len);
                 if(tmp != NULL)
                 {
                     shared_frame_buf = tmp;
-                    shared_frame_len = fb->len; 
+                    shared_frame_len = max_len; 
                 }
                 else
                 {
                     ESP_LOGE(TAG, "Cannot realloc memory");
                     video_capture_release_frame(&cap, fb);
                     vTaskDelay(pdMS_TO_TICKS(100));
+                    retry++;
+                    if(retry > 10)
+                        esp_restart();
                     continue;
                 }
             }
+            retry = 0;
 
             // 2. Chiếm quyền bảo vệ Mutex thật nhanh
             if (xSemaphoreTake(s_frame_mutex, pdMS_TO_TICKS(1)) == pdTRUE) 
@@ -199,9 +216,10 @@ void camera_capture_individual_task(void *pvParameters)
             }
                 
             cnt++;
-            if(cnt%fps == 0)
+            if(cnt%(10*fps) == 0)
                 ESP_LOGI(TAG, "Frame captured in %d ms, len %d, speed %dfps", pdTICKS_TO_MS(xTaskGetTickCount() - start_time), shared_frame_len, fps);
             video_capture_release_frame(&cap, fb);
+            vTaskDelay(pdMS_TO_TICKS(1));
         }
 
         xTaskDelayUntil(&start_time, pdMS_TO_TICKS(1000/fps));
