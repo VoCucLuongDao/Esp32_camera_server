@@ -32,7 +32,8 @@
 #define WIFI_SSID_ACESS     "LT29"
 #define WIFI_PASS_ACESS     "vcld1876317"
 #define SERVER_PORT_ACCESS   1357
-#define AUTH_PASSWORD       "pass187631\n" 
+#define AUTH_PASSWORD       "pass187631\n"
+#define UDP_BROADCAST_PORT   5005 
 
 
 void wifi_init_softap(void);

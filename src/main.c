@@ -21,10 +21,9 @@ void app_main(void)
     ESP_ERROR_CHECK(ret);
 
     s_frame_mutex = xSemaphoreCreateMutex();
-    
+
     xTaskCreatePinnedToCore(camera_capture_individual_task, "indiv_capture_task", 4096, NULL, 10, NULL, 0);
-    //xTaskCreatePinnedToCore(start_host_web_server, "socket_server", 4096, NULL, 5, NULL, 1);
-    xTaskCreatePinnedToCore(video_stream_task, "video_stream_task", 4096, NULL, 5, NULL, 1);
+    xTaskCreatePinnedToCore(video_stream_task, "video_stream_task", 4096, NULL, 10, NULL, 1);
 
     while(1)
     {

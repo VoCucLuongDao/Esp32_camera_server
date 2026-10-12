@@ -54,13 +54,13 @@ bool camera_init(esp_video_capture_t* cap)
     cap->config.pin_sccb_scl   = SIOC_GPIO_NUM;
     cap->config.pin_pwdn       = PWDN_GPIO_NUM;
     cap->config.pin_reset      = RESET_GPIO_NUM;
-    cap->config.xclk_freq_hz   = 24000000;          //24MHZ
-    
+    cap->config.xclk_freq_hz   = 20000000;          //24MHZ
+
     // Cấu hình định dạng và nén bằng phần cứng
     cap->config.pixel_format   = PIXFORMAT_JPEG;
-    cap->config.frame_size     = FRAMESIZE_VGA;       // 1280x720
-    cap->config.jpeg_quality   = 16;                 // Tối ưu cân bằng dung lượng/băng thông mạng
-    
+    cap->config.frame_size     = FRAMESIZE_XGA;       // 1280x720
+    cap->config.jpeg_quality   = 8;                 // Tối ưu cân bằng dung lượng/băng thông mạng
+
     // Chiến lược quản lý Bộ đệm DMA nâng cao trên PSRAM
     cap->config.fb_location    = CAMERA_FB_IN_PSRAM; // Ép buộc lưu trên PSRAM
     cap->config.fb_count       = 1;                  // Bật chế độ Ping-Pong DMA
@@ -79,37 +79,36 @@ bool camera_init(esp_video_capture_t* cap)
         // --- 1. GIỮ NGUYÊN CẤU HÌNH RAW VGA THEO YÊU CẦU CỦA BẠN ---
         s->set_res_raw(s, 1, 0, 0, 0, 0, 0, 800, 600, 640, 480, false, false);
 
-        // --- 2. GIỮ CẤU HÌNH ĐỘ SÁNG VÀ MÀU SẮC ĐÃ CHUẨN ---
-        s->set_brightness(s, 2);     // Giữ độ sáng phần mềm tối đa (+2) để bù đắp cho chuyển động nhanh
+        // --- 2. GIỮ CẤU HÌNH MÀU SẮC ĐẬM NÉT ---
+        s->set_brightness(s, 1);     // Giữ độ sáng phần mềm tối đa (+2)
         s->set_contrast(s, 1);       
-        s->set_saturation(s, 2);     
+        s->set_saturation(s, 2);     // Giữ màu sắc đậm đà, không bị bệt khi nâng sáng
         s->set_special_effect(s, 0); 
 
         s->set_whitebal(s, 1);       
         s->set_awb_gain(s, 1);       
         s->set_wb_mode(s, 0);        
 
-        // --- 3. BÍ QUYẾT TRIỆT TIÊU LAG KHI CHUYỂN ĐỘNG NHANH CHO RAW VGA ---
+        // --- 3. ĐIỀU TỐC XUNG NHỊP CHỐNG NGHẼN BỘ ĐỆM (GIỮ NGUYÊN ĐỘ MƯỢT) ---
         s->set_reg(s, 0xff, 0xff, 0x00); // Vào Bank 0 để chỉnh luồng DSP
-        // Đẩy bộ chia xung nhịp PCLK lên mức tối đa (0x1F) để kéo giãn thời gian truyền tải pixel. 
-        // Điều này giúp bộ đệm PSRAM không bao giờ bị nghẽn mạch kể cả khi bạn quơ tay thật nhanh.
-        s->set_reg(s, 0xd3, 0xff, 0x1F); // [ĐẨY LÊN MỨC TRẦN TỐI ĐA 0x1F]
+        s->set_reg(s, 0xd3, 0xff, 0x1F); // Giữ bộ chia xung nhịp ở mức tối đa để chống giật lag
 
-        // --- 4. GIỮ TỰ ĐỘNG PHƠI SÁNG (AEC) CHỐNG SỌC ĐÈN ĐIỆN 50HZ ---
+        // --- 4. GIẢI PHÁP LÀM SÁNG BỪNG VÙNG NGƯỢC SÁNG VÀ DIỆT SỌC ĐÈN ---
         s->set_exposure_ctrl(s, 1);  // Bật tự động đo sáng
-        s->set_aec2(s, 0);           // Đảm bảo tắt AEC2 để giải phóng dung lượng RAM xử lý cho chip
-        s->set_ae_level(s, 0);       // Đưa ae_level về 0 để chip không bị ép mở màn trập quá lâu khi di chuyển nhanh
+        s->set_aec2(s, 1);           // [BẬT LÊN 1]: Kích hoạt mạch AEC2 chuyên dụng để tự động nhận diện và cứu sáng vùng ngược sáng (khuôn mặt)
+        s->set_ae_level(s, 2);       // [TĂNG LÊN 2]: Ép mức trần bù sáng tự động lên cao nhất để đẩy toàn bộ vùng tối sáng lên
 
         s->set_reg(s, 0xff, 0xff, 0x01); // Vào Bank 1
         s->set_reg(s, 0x11, 0xff, 0x01); // Giữ tỷ lệ phân tần nội bộ mượt với bộ đệm
         s->set_reg(s, 0x3d, 0x03, 0x01); // Bộ lọc tần số quét vật lý 50Hz phần cứng chống sọc đèn phòng
         
-        // Ép ma trận đo sáng tự động của cảm biến sang chế độ ưu tiên tốc độ quét khung hình tuyệt đối
-        s->set_reg(s, 0x13, 0xff, 0x07); // [ĐỔI TỪ 0xC7 VỀ 0x07]: Cấu hình ép chip ngắt phơi sáng dài khi phát hiện biến động chuyển động nhanh
+        // Cấu hình lại ma trận đo sáng thông minh sang chế độ tự động cân bằng dải sáng động (Auto WDR)
+        s->set_reg(s, 0x13, 0xff, 0xc7); // [ĐỔI TỪ 0x07 LÊN 0xC7]: Cho phép chip tự động tính toán bù phơi sáng cho vùng tối sâu khi bị ngược sáng
+        s->set_reg(s, 0x4d, 0xff, 0x40); // Khóa đỉnh dải quét bóng đèn, triệt tiêu dải sọc sậm màu ngang người
 
-        // --- 5. GIỮ ĐỘ LỢI SÁNG ĐỂ ẢNH MỊN, HẠN CHẾ SỌC NHIỄU ---
+        // --- 5. TĂNG MẠNH TRẦN ĐỘ LỢI SÁNG (GAIN) ĐỂ CỨU CHI TIẾT NGƯỜI VÀ MẶT ---
         s->set_gain_ctrl(s, 1);      
-        s->set_gainceiling(s, (gainceiling_t)2); // Giữ trần khuếch đại ở mức GAINCEILING_8X chống sọc nhiễu mảnh
+        s->set_gainceiling(s, (gainceiling_t)4); // [NÂNG LÊN MỨC 4 - GAINCEILING_16X]: Đẩy trần kích sáng phần cứng giúp kéo rõ nét các chi tiết trong bóng râm
 
         // --- 6. GIỮ CÁC BỘ LỌC HOÀN THIỆN VÀ CHIỀU XOAY ẢNH CHUẨN ---
         s->set_bpc(s, 1);            
@@ -141,7 +140,7 @@ bool video_capture_read(esp_video_capture_t* cap, camera_fb_t** frame) {
     // Hàm này sẽ block luồng cho đến khi bộ điều khiển DMA điền đầy 1 Frame Buffer trong PSRAM
     *frame = esp_camera_fb_get();
     if (*frame == NULL) {
-        ESP_LOGE(TAG, "DMA lỗi hoặc không thể lấy Frame từ PSRAM Queue");
+        ESP_LOGE(TAG, "DMA error can not retrieve a framefrom PSRAM Queue");
         return false;
     }
     return true;
@@ -163,7 +162,7 @@ void video_capture_close(esp_video_capture_t* cap) {
 }
 
 // ==================== [TASK CHỤP ẢNH ĐỘC LẬP - CHẠY TẠI CORE 0] ====================
-void camera_capture_individual_task(void *pvParameters) 
+void camera_capture_individual_task(void *pvParameters)
 {
     esp_video_capture_t cap = {0};
     if (!camera_init(&cap)) {
@@ -178,17 +177,16 @@ void camera_capture_individual_task(void *pvParameters)
     uint16_t cnt = 0;
     uint16_t max_len = 0;
     uint16_t retry = 0;
-    while (1) 
+    while (1)
     {
-        start_time = xTaskGetTickCount();
-        
         // 1. Chờ và lấy khung hình từ DMA hoán đổi tự động
         if (video_capture_read(&cap, &fb))
         {
+            start_time = xTaskGetTickCount();
             if(shared_frame_buf == NULL || max_len < fb->len)
             {
                 max_len = fb->len;
-                uint8_t* tmp = realloc(shared_frame_buf, max_len);
+                uint8_t* tmp = (uint8_t *)heap_caps_realloc(shared_frame_buf, max_len, MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
                 if(tmp != NULL)
                 {
                     shared_frame_buf = tmp;
@@ -208,20 +206,27 @@ void camera_capture_individual_task(void *pvParameters)
             retry = 0;
 
             // 2. Chiếm quyền bảo vệ Mutex thật nhanh
-            if (xSemaphoreTake(s_frame_mutex, pdMS_TO_TICKS(1)) == pdTRUE) 
+            if (xSemaphoreTake(s_frame_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) 
             {
                 memcpy(shared_frame_buf, fb->buf, fb->len);
                 shared_frame_len = fb->len;
                 xSemaphoreGive(s_frame_mutex);
+                vTaskDelay(pdMS_TO_TICKS(1));
+                xTaskDelayUntil(&start_time, pdMS_TO_TICKS(1000/fps));
             }
-                
+            else
+            {
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
             cnt++;
-            if(cnt%(10*fps) == 0)
+            if(cnt%fps == 0)
                 ESP_LOGI(TAG, "Frame captured in %d ms, len %d, speed %dfps", pdTICKS_TO_MS(xTaskGetTickCount() - start_time), shared_frame_len, fps);
             video_capture_release_frame(&cap, fb);
-            vTaskDelay(pdMS_TO_TICKS(1));
         }
-
-        xTaskDelayUntil(&start_time, pdMS_TO_TICKS(1000/fps));
+        else
+        {
+            ESP_LOGE(TAG, "DMA error can not retrieve a frame from PSRAM Queue");
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
     }
 }

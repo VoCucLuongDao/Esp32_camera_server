@@ -20,19 +20,22 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
     static uint8_t s_retry_num = 0;
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
-    } 
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
     else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         if (s_retry_num < 5) {
             esp_wifi_connect();
             s_retry_num++;
             ESP_LOGE(TAG, "Connection failed. Retrying (%d/%d)...", s_retry_num, 5);
+            vTaskDelay(pdMS_TO_TICKS(1000));
         } else {
             // Chỉ kích hoạt FAIL_BIT khi đã thử hết số lần quy định
             xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+            if(fps > 1) 
+                esp_restart();
         }
     } 
     else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-        // ĐÃ NHẬN IP THÀNH CÔNG -> Kích hoạt CONNECTED_BIT tại đây
         s_retry_num = 0;
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }
@@ -224,6 +227,9 @@ void wifi_init_sta(void)
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 
+    // Tắt power saving để tăng độ ổn định kết nối
+    esp_wifi_set_ps(WIFI_PS_NONE);
+
     esp_netif_ip_info_t ip_info;
     bool is_assigned_ip = false;
 
@@ -272,7 +278,83 @@ void wifi_init_sta(void)
     ESP_LOGI(TAG, "ESP32 IPv4 Address : " IPSTR, IP2STR(&ip_info.ip));
     ESP_LOGI(TAG, "Subnet Mask        : " IPSTR, IP2STR(&ip_info.netmask));
     ESP_LOGI(TAG, "Gateway (Router)   : " IPSTR, IP2STR(&ip_info.gw));
-    ESP_LOGI(TAG, "==============================================");\
+    ESP_LOGI(TAG, "==============================================");
+}
+
+// Function to discover server IP via UDP request-response
+static bool discover_server_ip(ip4_addr_t *target_ip) {
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    if (sock < 0) {
+        ESP_LOGE(TAG, "Failed to create UDP socket");
+        return false;
+    }
+
+    // Enable broadcast to send discovery request
+    int broadcast = 1;
+    setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &broadcast, sizeof(broadcast));
+
+    ESP_LOGI(TAG, "Sending discovery request on UDP port %d...", UDP_BROADCAST_PORT);
+
+    // Set timeout for receiving
+    struct timeval timeout;
+    timeout.tv_sec = 10;  // 10 seconds timeout
+    timeout.tv_usec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+    // Prepare discovery request
+    const char *discovery_msg = "DISCOVER_SERVER";
+
+    // Send broadcast discovery request
+    struct sockaddr_in broadcast_addr;
+    broadcast_addr.sin_family = AF_INET;
+    broadcast_addr.sin_port = htons(UDP_BROADCAST_PORT);
+    broadcast_addr.sin_addr.s_addr = INADDR_BROADCAST;
+
+    int sent = sendto(sock, discovery_msg, strlen(discovery_msg), 0,
+                     (struct sockaddr *)&broadcast_addr, sizeof(broadcast_addr));
+
+    if (sent < 0) {
+        ESP_LOGE(TAG, "Failed to send discovery request");
+        close(sock);
+        return false;
+    }
+
+    ESP_LOGI(TAG, "Discovery request sent. Waiting for response...");
+
+    // Wait for response
+    char rx_buffer[128];
+    struct sockaddr_in from_addr;
+    socklen_t from_len = sizeof(from_addr);
+
+    int len = recvfrom(sock, rx_buffer, sizeof(rx_buffer) - 1, 0,
+                      (struct sockaddr *)&from_addr, &from_len);
+
+    if (len < 0) {
+        ESP_LOGE(TAG, "UDP receive timeout or error");
+        close(sock);
+        return false;
+    }
+
+    rx_buffer[len] = '\0';
+    ESP_LOGI(TAG, "Received UDP response from %s: %s",
+             ip4addr_ntoa((const ip4_addr_t *)&from_addr.sin_addr), rx_buffer);
+
+    // Parse the message format: "KEY-IP x.x.x.x"
+    if (strncmp(rx_buffer, "KEY-IP ", 7) == 0) {
+        char *ip_str = rx_buffer + 7;
+        if (ip4addr_aton(ip_str, target_ip) != 0) {
+            ESP_LOGI(TAG, "Server IP discovered: " IPSTR, IP2STR(target_ip));
+            close(sock);
+            return true;
+        } else {
+            ESP_LOGE(TAG, "Failed to parse IP from response message");
+        }
+    } else {
+        ESP_LOGE(TAG, "Invalid response format");
+    }
+
+    close(sock);
+    return false;
 }
 
 void video_stream_task(void *pvParameters)
@@ -285,127 +367,150 @@ void video_stream_task(void *pvParameters)
 
     ip4_addr_t target_ip;
 
-    while(ip4addr_aton("192.168.137.1", &target_ip) == 0) 
+    fps = 2;
+    // Discovery and connection loop
+    while (1)
     {
-        ESP_LOGE(TAG, "Invalid Server IP configuration");
-        vTaskDelay(pdMS_TO_TICKS(3000));
-    }
-    dest_addr.sin_addr.s_addr = target_ip.addr;
-
-    // Set Send and Receive timeouts to 3 seconds to prevent permanent hanging
-    struct timeval timeout;
-    timeout.tv_sec = 3;
-    timeout.tv_usec = 0;
-    int fail_connect_cnt = 0;
-
-    while (1) {
-        int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
-        if (sock < 0) {
-            ESP_LOGE(TAG, "Failed to create socket. Retrying in 3 seconds...");
-            vTaskDelay(pdMS_TO_TICKS(3000));
-            fail_connect_cnt++;
-            if(fail_connect_cnt > 5)
-                break;
-            continue;
-        }
-
-        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
-
-        if (connect(sock, (struct sockaddr *)&dest_addr, sizeof(dest_addr)) != 0) {
-            ESP_LOGE(TAG, "Connection failed! Retrying in 3 seconds...");
-            close(sock);
-            vTaskDelay(pdMS_TO_TICKS(3000));
-            fail_connect_cnt++;
-            if(fail_connect_cnt > 5)
-                break;
-            continue;
-        }
-        
-        ESP_LOGI(TAG, "TCP CONNECTED. Sending credentials for authentication...");
-        fail_connect_cnt = 0;
-
-        // --- STEP 1: AUTHENTICATION HANDSHAKE ---
-        int err = send(sock, AUTH_PASSWORD, strlen(AUTH_PASSWORD), 0);
-        if (err < 0) {
-            ESP_LOGE(TAG, "Failed to transmit password buffer.");
-            close(sock);
+        // Discover server IP via UDP broadcast
+        ESP_LOGI(TAG, "Starting server IP discovery...");
+        if (!discover_server_ip(&target_ip)) {
+            ESP_LOGE(TAG, "Failed to discover server IP. Retrying in 3 seconds...");
             vTaskDelay(pdMS_TO_TICKS(3000));
             continue;
         }
+        dest_addr.sin_addr.s_addr = target_ip.addr;
 
-        char rx_buffer[32];
-        memset(rx_buffer, 0, sizeof(rx_buffer));
-        int len = recv(sock, rx_buffer, sizeof(rx_buffer) - 1, 0);
-        
-        if (len <= 0 || strstr(rx_buffer, "AUTH_OK") == NULL) {
-            ESP_LOGE(TAG, "Authentication DENIED by host server. Server response: %s", len > 0 ? rx_buffer : "NONE/TIMEOUT");
-            close(sock);
-            vTaskDelay(pdMS_TO_TICKS(3000));
-            continue;
-        }
-
-        ESP_LOGI(TAG, "Authentication SUCCESSFUL! Initiating video stream from shared_frame_buf.");
-
-        // --- STEP 2: VIDEO STREAM LOOP FROM SHARED MEMORY BUFFER ---
-        TickType_t start_time = 0;
-        int cnt = 0;
-        fps = 25;
+        // Set Send and Receive timeouts to 3 seconds to prevent permanent hanging
+        struct timeval timeout;
+        timeout.tv_sec = 3;
+        timeout.tv_usec = 0;
         while (1) 
         {
-            start_time = xTaskGetTickCount();
-
-            // Guard against unallocated or empty shared memory
-            if (shared_frame_buf == NULL || shared_frame_len == 0) {
-                 ESP_LOGI(TAG, "Shared frame buffer is empty or unallocated. Waiting...");
-                vTaskDelay(pdMS_TO_TICKS(1000));
+            int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+            if (sock < 0) {
+                ESP_LOGE(TAG, "Failed to create socket. Retrying in 3 seconds...");
+                vTaskDelay(pdMS_TO_TICKS(3000));
                 continue;
             }
 
-            // Safely lock the shared buffer using your external mutex
-            if (shared_frame_buf != NULL &&
-                shared_frame_len > 0 &&
-                xSemaphoreTake(s_frame_mutex, pdMS_TO_TICKS(1)) == pdTRUE)
+            setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+            setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+
+            if (connect(sock, (struct sockaddr *)&dest_addr, sizeof(dest_addr)) != 0) {
+                ESP_LOGE(TAG, "Connection failed! Retrying in 3 seconds...");
+                close(sock);
+                vTaskDelay(pdMS_TO_TICKS(3000));
+                continue;
+            }
+
+            ESP_LOGI(TAG, "TCP CONNECTED. Sending credentials for authentication...");
+
+            // --- STEP 1: AUTHENTICATION HANDSHAKE ---
+            int err = send(sock, AUTH_PASSWORD, strlen(AUTH_PASSWORD), 0);
+            if (err < 0) {
+                ESP_LOGE(TAG, "Failed to transmit password buffer.");
+                close(sock);
+                vTaskDelay(pdMS_TO_TICKS(3000));
+                continue;
+            }
+
+            char rx_buffer[32];
+            memset(rx_buffer, 0, sizeof(rx_buffer));
+            int len = recv(sock, rx_buffer, sizeof(rx_buffer) - 1, 0);
+
+            if (len <= 0) {
+                ESP_LOGE(TAG, "Authentication TIMEOUT or server not responding.");
+                close(sock);
+                vTaskDelay(pdMS_TO_TICKS(3000));
+                continue;
+            }
+
+            if (strstr(rx_buffer, "AUTH_OK") == NULL) {
+                ESP_LOGE(TAG, "Authentication DENIED by host server. Server response: %s", rx_buffer);
+                close(sock);
+                vTaskDelay(pdMS_TO_TICKS(3000));
+                continue;
+            }
+
+            ESP_LOGI(TAG, "Authentication SUCCESSFUL! Initiating video stream from shared_frame_buf.");
+
+            // --- STEP 2: VIDEO STREAM LOOP FROM SHARED MEMORY BUFFER ---
+            TickType_t start_time = 0;
+            int cnt = 0;
+            int error_cnt = 0;  // Track consecutive errors
+            fps = 20;  // Set to higher FPS after successful connection
+
+            while (1)
             {
-                uint32_t image_len = (uint32_t)shared_frame_len;
-                
-                // 2.1 Send frame size header (4 bytes payload declaration)
-                err = send(sock, &image_len, sizeof(image_len), 0);
-                if (err >= 0)
-                {
-                    // 2.2 Send binary payload data
-                    size_t bytes_sent = 0;
-                    while (bytes_sent < image_len) 
-                    {
-                        int sent = send(sock, shared_frame_buf + bytes_sent, image_len - bytes_sent, 0);
-                        if (sent <= 0)
-                        {
-                            ESP_LOGE(TAG, "Socket transmission failed during packet payload delivery.");
-                            err = -1;
-                            break;
-                        }
-                        bytes_sent += sent;
-                    }
-                } 
-                else
-                {
-                    ESP_LOGE(TAG, "Socket transmission failed during packet size header delivery.");
-                    break;
+                start_time = xTaskGetTickCount();
+
+                // Guard against unallocated or empty shared memory
+                if (shared_frame_buf == NULL || shared_frame_len == 0) {
+                    ESP_LOGI(TAG, "Shared frame buffer is empty or unallocated. Waiting...");
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                    continue;
                 }
 
-                // Immediately release the mutex to let the frame producer write new frames
-                xSemaphoreGive(s_frame_mutex);
-                cnt++;
-                if(cnt%fps == 0)
-                    ESP_LOGI(TAG, "Sent a frame in %d ms, len %d, speed %dfps", pdTICKS_TO_MS(xTaskGetTickCount() - start_time), image_len, fps);
-                vTaskDelay(pdMS_TO_TICKS(1));
+                // Safely lock the shared buffer using your external mutex
+                if (shared_frame_buf != NULL &&
+                    shared_frame_len > 0 &&
+                    xSemaphoreTake(s_frame_mutex, pdMS_TO_TICKS(1)) == pdTRUE)
+                {
+                    uint32_t image_len = (uint32_t)shared_frame_len;
+
+                    // 2.1 Send frame size header (4 bytes payload declaration)
+                    err = send(sock, &image_len, sizeof(image_len), 0);
+                    if (err >= 0)
+                    {
+                        // 2.2 Send binary payload data
+                        size_t bytes_sent = 0;
+                        while (bytes_sent < image_len)
+                        {
+                            int sent = send(sock, shared_frame_buf + bytes_sent, image_len - bytes_sent, 0);
+                            if (sent <= 0)
+                            {
+                                ESP_LOGE(TAG, "Socket transmission failed during packet payload delivery.");
+                                err = -1;
+                                error_cnt++;
+                                if (error_cnt > 10) {
+                                    ESP_LOGE(TAG, "Too many consecutive errors (%d). Breaking connection.", error_cnt);
+                                }
+                                break;
+                            }
+                            bytes_sent += sent;
+                        }
+                    }
+                    else
+                    {
+                        ESP_LOGE(TAG, "Socket transmission failed during packet size header delivery.");
+                        error_cnt++;
+                        if (error_cnt > 10) {
+                            ESP_LOGE(TAG, "Too many consecutive errors (%d). Breaking connection.", error_cnt);
+                            break;
+                        }
+                        break;
+                    }
+
+                    // Reset error counter on successful transmission
+                    error_cnt = 0;
+
+                    // Immediately release the mutex to let the frame producer write new frames
+                    xSemaphoreGive(s_frame_mutex);
+                    cnt++;
+                    if(cnt%fps == 0)
+                        ESP_LOGI(TAG, "Sent a frame in %d ms, len %d, speed %dfps", pdTICKS_TO_MS(xTaskGetTickCount() - start_time), image_len, fps);  
+                    vTaskDelay(pdMS_TO_TICKS(1));
+                    xTaskDelayUntil(&start_time, pdMS_TO_TICKS(1000/fps));
+                }
+                else
+                {
+                    vTaskDelay(pdMS_TO_TICKS(10));
+                }
             }
-            xTaskDelayUntil(&start_time, pdMS_TO_TICKS(1000/fps));
+            ESP_LOGE(TAG, "Connection lost! Closing socket descriptor and restarting connection sequence in 3 seconds...");
+            xSemaphoreGive(s_frame_mutex);
+            close(sock);
+            vTaskDelay(pdMS_TO_TICKS(3000));
         }
-        fps = 1;
-        ESP_LOGE(TAG, "Connection lost! Closing socket descriptor and restarting connection sequence in 3 seconds...");
-        xSemaphoreGive(s_frame_mutex);
-        close(sock);
-        vTaskDelay(pdMS_TO_TICKS(3000)); 
     }
 }
