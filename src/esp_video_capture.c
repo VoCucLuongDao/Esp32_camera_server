@@ -54,7 +54,7 @@ bool camera_init(esp_video_capture_t* cap)
     cap->config.pin_sccb_scl   = SIOC_GPIO_NUM;
     cap->config.pin_pwdn       = PWDN_GPIO_NUM;
     cap->config.pin_reset      = RESET_GPIO_NUM;
-    cap->config.xclk_freq_hz   = 24000000;          //24MHZ
+    cap->config.xclk_freq_hz   = 20000000;          //24MHZ
     
     // Cấu hình định dạng và nén bằng phần cứng
     cap->config.pixel_format   = PIXFORMAT_JPEG;
@@ -74,42 +74,41 @@ bool camera_init(esp_video_capture_t* cap)
         return false;
     }
     
-   sensor_t *s = esp_camera_sensor_get();
+sensor_t *s = esp_camera_sensor_get();
     if (s != NULL) {
         // --- 1. GIỮ NGUYÊN CẤU HÌNH RAW VGA THEO YÊU CẦU CỦA BẠN ---
         s->set_res_raw(s, 1, 0, 0, 0, 0, 0, 800, 600, 640, 480, false, false);
 
-        // --- 2. GIỮ CẤU HÌNH ĐỘ SÁNG VÀ MÀU SẮC ĐÃ CHUẨN ---
-        s->set_brightness(s, 2);     // Giữ độ sáng phần mềm tối đa (+2) để bù đắp cho chuyển động nhanh
+        // --- 2. GIỮ CẤU HÌNH MÀU SẮC ĐẬM NÉT ---
+        s->set_brightness(s, 1);     // Giữ độ sáng phần mềm tối đa (+2)
         s->set_contrast(s, 1);       
-        s->set_saturation(s, 2);     
+        s->set_saturation(s, 2);     // Giữ màu sắc đậm đà, không bị bệt khi nâng sáng
         s->set_special_effect(s, 0); 
 
         s->set_whitebal(s, 1);       
         s->set_awb_gain(s, 1);       
         s->set_wb_mode(s, 0);        
 
-        // --- 3. BÍ QUYẾT TRIỆT TIÊU LAG KHI CHUYỂN ĐỘNG NHANH CHO RAW VGA ---
+        // --- 3. ĐIỀU TỐC XUNG NHỊP CHỐNG NGHẼN BỘ ĐỆM (GIỮ NGUYÊN ĐỘ MƯỢT) ---
         s->set_reg(s, 0xff, 0xff, 0x00); // Vào Bank 0 để chỉnh luồng DSP
-        // Đẩy bộ chia xung nhịp PCLK lên mức tối đa (0x1F) để kéo giãn thời gian truyền tải pixel. 
-        // Điều này giúp bộ đệm PSRAM không bao giờ bị nghẽn mạch kể cả khi bạn quơ tay thật nhanh.
-        s->set_reg(s, 0xd3, 0xff, 0x1F); // [ĐẨY LÊN MỨC TRẦN TỐI ĐA 0x1F]
+        s->set_reg(s, 0xd3, 0xff, 0x1F); // Giữ bộ chia xung nhịp ở mức tối đa để chống giật lag
 
-        // --- 4. GIỮ TỰ ĐỘNG PHƠI SÁNG (AEC) CHỐNG SỌC ĐÈN ĐIỆN 50HZ ---
+        // --- 4. GIẢI PHÁP LÀM SÁNG BỪNG VÙNG NGƯỢC SÁNG VÀ DIỆT SỌC ĐÈN ---
         s->set_exposure_ctrl(s, 1);  // Bật tự động đo sáng
-        s->set_aec2(s, 0);           // Đảm bảo tắt AEC2 để giải phóng dung lượng RAM xử lý cho chip
-        s->set_ae_level(s, 0);       // Đưa ae_level về 0 để chip không bị ép mở màn trập quá lâu khi di chuyển nhanh
+        s->set_aec2(s, 1);           // [BẬT LÊN 1]: Kích hoạt mạch AEC2 chuyên dụng để tự động nhận diện và cứu sáng vùng ngược sáng (khuôn mặt)
+        s->set_ae_level(s, 2);       // [TĂNG LÊN 2]: Ép mức trần bù sáng tự động lên cao nhất để đẩy toàn bộ vùng tối sáng lên
 
         s->set_reg(s, 0xff, 0xff, 0x01); // Vào Bank 1
         s->set_reg(s, 0x11, 0xff, 0x01); // Giữ tỷ lệ phân tần nội bộ mượt với bộ đệm
         s->set_reg(s, 0x3d, 0x03, 0x01); // Bộ lọc tần số quét vật lý 50Hz phần cứng chống sọc đèn phòng
         
-        // Ép ma trận đo sáng tự động của cảm biến sang chế độ ưu tiên tốc độ quét khung hình tuyệt đối
-        s->set_reg(s, 0x13, 0xff, 0x07); // [ĐỔI TỪ 0xC7 VỀ 0x07]: Cấu hình ép chip ngắt phơi sáng dài khi phát hiện biến động chuyển động nhanh
+        // Cấu hình lại ma trận đo sáng thông minh sang chế độ tự động cân bằng dải sáng động (Auto WDR)
+        s->set_reg(s, 0x13, 0xff, 0xc7); // [ĐỔI TỪ 0x07 LÊN 0xC7]: Cho phép chip tự động tính toán bù phơi sáng cho vùng tối sâu khi bị ngược sáng
+        s->set_reg(s, 0x4d, 0xff, 0x40); // Khóa đỉnh dải quét bóng đèn, triệt tiêu dải sọc sậm màu ngang người
 
-        // --- 5. GIỮ ĐỘ LỢI SÁNG ĐỂ ẢNH MỊN, HẠN CHẾ SỌC NHIỄU ---
+        // --- 5. TĂNG MẠNH TRẦN ĐỘ LỢI SÁNG (GAIN) ĐỂ CỨU CHI TIẾT NGƯỜI VÀ MẶT ---
         s->set_gain_ctrl(s, 1);      
-        s->set_gainceiling(s, (gainceiling_t)2); // Giữ trần khuếch đại ở mức GAINCEILING_8X chống sọc nhiễu mảnh
+        s->set_gainceiling(s, (gainceiling_t)4); // [NÂNG LÊN MỨC 4 - GAINCEILING_16X]: Đẩy trần kích sáng phần cứng giúp kéo rõ nét các chi tiết trong bóng râm
 
         // --- 6. GIỮ CÁC BỘ LỌC HOÀN THIỆN VÀ CHIỀU XOAY ẢNH CHUẨN ---
         s->set_bpc(s, 1);            
