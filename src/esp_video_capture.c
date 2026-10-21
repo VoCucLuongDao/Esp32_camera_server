@@ -58,7 +58,7 @@ bool camera_init(esp_video_capture_t* cap)
 
     // Cấu hình định dạng và nén bằng phần cứng
     cap->config.pixel_format   = PIXFORMAT_JPEG;
-    cap->config.frame_size     = FRAMESIZE_XGA;       // 1280x720
+    cap->config.frame_size     = FRAMESIZE_HD;       // 1280x720
     cap->config.jpeg_quality   = 8;                 // Tối ưu cân bằng dung lượng/băng thông mạng
 
     // Chiến lược quản lý Bộ đệm DMA nâng cao trên PSRAM
@@ -73,14 +73,14 @@ bool camera_init(esp_video_capture_t* cap)
         cap->is_opened = false;
         return false;
     }
-    
+        
    sensor_t *s = esp_camera_sensor_get();
     if (s != NULL) {
         // --- 1. GIỮ NGUYÊN CẤU HÌNH RAW VGA THEO YÊU CẦU CỦA BẠN ---
-        s->set_res_raw(s, 1, 0, 0, 0, 0, 0, 800, 600, 640, 480, false, false);
+        s->set_res_raw(s, 0, 0, 0, 0, 0, 240, 1280, 240, 1280, 240, false, false);
 
         // --- 2. GIỮ CẤU HÌNH MÀU SẮC ĐẬM NÉT ---
-        s->set_brightness(s, 1);     // Giữ độ sáng phần mềm tối đa (+2)
+        s->set_brightness(s, 0);     // Giữ độ sáng phần mềm tối đa (+2)
         s->set_contrast(s, 1);       
         s->set_saturation(s, 2);     // Giữ màu sắc đậm đà, không bị bệt khi nâng sáng
         s->set_special_effect(s, 0); 
@@ -95,8 +95,8 @@ bool camera_init(esp_video_capture_t* cap)
 
         // --- 4. GIẢI PHÁP LÀM SÁNG BỪNG VÙNG NGƯỢC SÁNG VÀ DIỆT SỌC ĐÈN ---
         s->set_exposure_ctrl(s, 1);  // Bật tự động đo sáng
-        s->set_aec2(s, 1);           // [BẬT LÊN 1]: Kích hoạt mạch AEC2 chuyên dụng để tự động nhận diện và cứu sáng vùng ngược sáng (khuôn mặt)
-        s->set_ae_level(s, 2);       // [TĂNG LÊN 2]: Ép mức trần bù sáng tự động lên cao nhất để đẩy toàn bộ vùng tối sáng lên
+        s->set_aec2(s, 0);           // [BẬT LÊN 1]: Kích hoạt mạch AEC2 chuyên dụng để tự động nhận diện và cứu sáng vùng ngược sáng (khuôn mặt)
+        s->set_ae_level(s, 0);       // [TĂNG LÊN 2]: Ép mức trần bù sáng tự động lên cao nhất để đẩy toàn bộ vùng tối sáng lên
 
         s->set_reg(s, 0xff, 0xff, 0x01); // Vào Bank 1
         s->set_reg(s, 0x11, 0xff, 0x01); // Giữ tỷ lệ phân tần nội bộ mượt với bộ đệm
@@ -226,7 +226,7 @@ void camera_capture_individual_task(void *pvParameters)
         else
         {
             ESP_LOGE(TAG, "DMA error can not retrieve a frame from PSRAM Queue");
-            vTaskDelay(pdMS_TO_TICKS(10));
+            vTaskDelay(pdMS_TO_TICKS(1000));
         }
     }
 }

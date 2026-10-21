@@ -378,6 +378,8 @@ void video_stream_task(void *pvParameters)
             vTaskDelay(pdMS_TO_TICKS(3000));
             continue;
         }
+
+        esp_wifi_set_max_tx_power(80); // Set max TX power to 80 (0-82 range for ESP32)
         dest_addr.sin_addr.s_addr = target_ip.addr;
 
         // Set Send and Receive timeouts to 3 seconds to prevent permanent hanging
