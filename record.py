@@ -11,33 +11,26 @@ SERVER_IP = "0.0.0.0"
 SERVER_PORT = 1357
 AUTH_PASSWORD = "pass187631"
 UDP_BROADCAST_PORT = 5005
-UDP_BROADCAST_INTERVAL = 3  # Send broadcast every 2 seconds  
 
-# CHỌN BỘ LỌC TẠI ĐÂY: 
-# "none"      -> Ảnh gốc
-# "gray"      -> Ảnh trắng đen
-# "blur"      -> Làm mịn / Khử nhiễu hạt
-# "sharp"     -> Làm nét chi tiết
-# "vintage"   -> Màu hoài cổ (ấm)
+# 👉 THAM SỐ RAW ĐƯỢC LƯU SẴN - TỰ ĐỘNG NỐI ĐUÔI GỬI NGAY SAU KHI KẾT NỐI TCP
+AUTO_RAW_CONFIG = "1,0,0,0,0,0,8000,600,640,320,0,0"
+
 FILTER_MODE = "sharp" 
-
-# Hàng đợi chứa các frame ảnh sẵn sàng hiển thị (Giới hạn tối đa 5 frame)
 frame_queue = queue.Queue(maxsize=5)
 
 def get_local_ip():
-    """Get the local IP address of the machine"""
+    """Lấy địa chỉ IP cục bộ của máy tính"""
     try:
-        # Create a UDP socket to find the local IP
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
         local_ip = s.getsockname()[0]
         s.close()
         return local_ip
-    except:
+    except Exception:
         return "127.0.0.1"
 
 def udp_discovery_thread():
-    """Thread to listen for ESP32 discovery requests and respond with server IP"""
+    """Luồng lắng nghe yêu cầu khám phá từ ESP32 và phản hồi IP Server"""
     discovery_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     discovery_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     discovery_socket.bind(('0.0.0.0', UDP_BROADCAST_PORT))
@@ -50,53 +43,40 @@ def udp_discovery_thread():
         while True:
             data, addr = discovery_socket.recvfrom(1024)
             message = data.decode('utf-8', errors='ignore')
-            print(f"[*] Received discovery request from {addr}: {message}")
-
-            # If ESP32 sends discovery request, respond with server IP
+            
             if message == "DISCOVER_SERVER":
                 response = f"KEY-IP {local_ip}"
                 discovery_socket.sendto(response.encode('utf-8'), addr)
-                print(f"[*] Sent server IP to {addr}: {response}")
+                print(f"[*] Responded to ESP32 discovery request from {addr}")
     except Exception as e:
         print(f"[-] UDP Discovery error: {e}")
     finally:
         discovery_socket.close()
 
 def apply_filter(frame, mode):
-    """Hàm xử lý và áp dụng bộ lọc lên frame ảnh OpenCV"""
+    """Hàm xử lý và áp dụng bộ lọc đồ họa lên frame ảnh OpenCV"""
     if mode == "none":
         return frame
-        
     elif mode == "gray":
-        # Chuyển sang ảnh xám (Trắng đen)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        # Chuyển ngược lại 3 kênh màu để đồng bộ hiển thị
         return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-        
     elif mode == "blur":
-        # Bộ lọc Gaussian Blur giúp làm mịn ảnh, giảm nhiễu hạt (noise) từ ESP32-CAM
         return cv2.GaussianBlur(frame, (5, 5), 0)
-        
     elif mode == "sharp":
-        # Ma trận Kernel giúp tăng cường độ sắc nét cho các đường viền
         kernel = np.array([[0, -1, 0], 
                            [-1, 5, -1], 
                            [0, -1, 0]])
         return cv2.filter2D(frame, -1, kernel)
-        
     elif mode == "vintage":
-        # Tạo hiệu ứng màu phim cũ bằng cách thay đổi ma trận màu sắc
         kernel = np.array([[0.272, 0.534, 0.131],
                            [0.349, 0.686, 0.168],
                            [0.393, 0.769, 0.189]])
         vintage_frame = cv2.transform(frame, kernel)
-        # Giới hạn giá trị pixel trong khoảng 0-255 để tránh lỗi hiển thị
         return np.clip(vintage_frame, 0, 255).astype(np.uint8)
-        
     return frame
 
 def tcp_receiver_thread():
-    """Luồng phụ: Chuyên nhận dữ liệu từ TCP và đẩy vào hàng đợi"""
+    """Luồng phụ: Gửi dữ liệu authen gộp thầm lặng và đón luồng nhận video TCP"""
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_socket.bind((SERVER_IP, SERVER_PORT))
@@ -106,10 +86,17 @@ def tcp_receiver_thread():
     try:
         while True:
             conn, addr = server_socket.accept()
-            print(f"[*] Incoming connection from: {addr}.")
+            print(f"\n[+] Incoming connection from: {addr}.")
             
             try:
-                # --- STEP 1: AUTHENTICATION ---
+                # --- STEP 1: AUTHENTICATION + APPENDED RAW CONFIG ---
+                # 👉 Tạo gói payload hỗn hợp: Mật khẩu nằm trước, lệnh SET_RAW nối ngay phía sau phân tách bằng \n
+                combined_payload = f"{AUTH_PASSWORD}\nSET_RAW:{AUTO_RAW_CONFIG}\n"
+                
+                print(f"[*] Transmitting integrated handshake payload to ESP32...")
+                conn.sendall(combined_payload.encode('utf-8'))
+                
+                # Chờ phản hồi xác thực ngược lại từ chip ESP32
                 client_auth_data = b""
                 connection_lost = False
                 while b"\n" not in client_auth_data:
@@ -118,24 +105,23 @@ def tcp_receiver_thread():
                         connection_lost = True
                         break
                     client_auth_data += packet
-                    if len(client_auth_data) > 100: 
+                    if len(client_auth_data) > 32: 
                         break 
                 
                 if connection_lost:
+                    print("[-] Connection lost during handshake.")
                     conn.close()
                     continue
 
-                received_password = client_auth_data.decode('utf-8', errors='ignore').strip()
-                if received_password == AUTH_PASSWORD:
-                    print(f"[+] Auth SUCCESSFUL for {addr}.")
-                    conn.sendall(b"AUTH_OK\n")
+                received_response = client_auth_data.decode('utf-8', errors='ignore').strip()
+                if received_response == "AUTH_OK":
+                    print(f"[+] Handshake SUCCESSFUL! ESP32 accepted configuration. Initializing stream...")
                 else:
-                    print(f"[-] Auth FAILED for {addr}.")
-                    conn.sendall(b"AUTH_FAIL\n")
+                    print(f"[-] Handshake DENIED by ESP32. Chip response: {received_response}")
                     conn.close()
                     continue
                     
-                # --- STEP 2: VIDEO RECEPTION ---
+                # --- STEP 2: VIDEO RECEPTION LOOP ---
                 data = b""
                 payload_size = struct.calcsize("<I")
                 
@@ -155,7 +141,7 @@ def tcp_receiver_thread():
                     msg_size = struct.unpack("<I", packed_msg_size)[0]
                     
                     if msg_size == 0 or msg_size > 1024 * 1024:
-                        print(f"[-] Invalid size {msg_size}. Resetting...")
+                        print(f"[-] Invalid frame size received ({msg_size}). Resetting...")
                         break
                     
                     while len(data) < msg_size:
@@ -171,6 +157,7 @@ def tcp_receiver_thread():
                     frame_data = data[:msg_size]
                     data = data[msg_size:]
                     
+                    # Đẩy dữ liệu nhị phân ảnh JPEG vào hàng đợi
                     if not frame_queue.full():
                         frame_queue.put(frame_data)
                     else:
@@ -181,48 +168,48 @@ def tcp_receiver_thread():
                             pass
                             
             except Exception as e:
-                print(f"[-] Connection error: {e}")
+                print(f"[-] Connection session error: {e}")
             finally:
                 conn.close()
-                print(f"[*] Disconnected from {addr}. Standing by...")
+                print(f"[-] Closed session socket with {addr}. Standing by for reconnect...")
     finally:
         server_socket.close()
 
 # ---------------------------------------------------------
-# LUỒNG CHÍNH (MAIN THREAD): Xử lý bộ lọc và hiển thị UI
+# LUỒNG CHÍNH (MAIN THREAD): Xử lý hiển thị cửa sổ giao diện video
 # ---------------------------------------------------------
 if __name__ == "__main__":
-    # Start UDP discovery thread (listen for ESP32 requests)
-    discovery = threading.Thread(target=udp_discovery_thread, daemon=True)
-    discovery.start()
+    # 1. Khởi động luồng UDP Discovery
+    discovery_thread = threading.Thread(target=udp_discovery_thread, daemon=True)
+    discovery_thread.start()
 
-    receiver = threading.Thread(target=tcp_receiver_thread, daemon=True)
-    receiver.start()
+    # 2. Khởi động luồng kết nối nhận video TCP
+    receiver_thread = threading.Thread(target=tcp_receiver_thread, daemon=True)
+    receiver_thread.start()
 
     print(f"[*] Main UI Thread running. Active filter: {FILTER_MODE.upper()}")
+    print("[*] Focus the video screen window and press 'q' to exit safely.")
     
     while True:
         try:
+            # Lấy mảng byte từ queue giải mã ảnh màu
             frame_data = frame_queue.get(timeout=0.1)
-            
             np_arr = np.frombuffer(frame_data, dtype=np.uint8)
             frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
             
             if frame is not None:
-                # 👉 ÁP DỤNG BỘ LỌC TẠI ĐÂY TRƯỚC KHI HIỂN THỊ
+                # Áp dụng bộ lọc mịn/nét/vintage trước khi kết xuất ảnh
                 processed_frame = apply_filter(frame, FILTER_MODE)
-                
-                # Hiển thị frame đã qua xử lý
                 cv2.imshow("ESP32-CAM Stream (Filtered)", processed_frame)
             else:
-                print("[-] Warning: Failed to decode JPEG frame.")
-                
+                print("[-] Warning: Failed to decode incoming JPEG frame data.")
         except queue.Empty:
             pass
 
+        # Nhấn phím 'q' trên màn hình OpenCV để ngắt chương trình sạch sẽ
         if cv2.waitKey(1) & 0xFF == ord('q'):
-            print("[*] 'q' pressed. Exiting...")
+            print("[*] 'q' command pressed. Shutting down application...")
             break
 
     cv2.destroyAllWindows()
-    print("[*] Application closed.")
+    print("[*] Terminal session successfully finished.")

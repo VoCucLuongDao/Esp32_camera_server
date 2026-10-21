@@ -8,6 +8,7 @@ size_t shared_frame_len = 0;
 uint8_t fps = 1;
 
 extern SemaphoreHandle_t s_frame_mutex;
+extern uint16_t g_cam_raw_params[12];
 
 bool camera_init(esp_video_capture_t* cap)
 {
@@ -54,11 +55,11 @@ bool camera_init(esp_video_capture_t* cap)
     cap->config.pin_sccb_scl   = SIOC_GPIO_NUM;
     cap->config.pin_pwdn       = PWDN_GPIO_NUM;
     cap->config.pin_reset      = RESET_GPIO_NUM;
-    cap->config.xclk_freq_hz   = 20000000;          //24MHZ
+    cap->config.xclk_freq_hz   = 10000000;          //24MHZ
 
     // Cấu hình định dạng và nén bằng phần cứng
     cap->config.pixel_format   = PIXFORMAT_JPEG;
-    cap->config.frame_size     = FRAMESIZE_XGA;       // 1280x720
+    cap->config.frame_size     = FRAMESIZE_SVGA;       // 1280x720
     cap->config.jpeg_quality   = 8;                 // Tối ưu cân bằng dung lượng/băng thông mạng
 
     // Chiến lược quản lý Bộ đệm DMA nâng cao trên PSRAM
@@ -73,14 +74,34 @@ bool camera_init(esp_video_capture_t* cap)
         cap->is_opened = false;
         return false;
     }
-    
+        
    sensor_t *s = esp_camera_sensor_get();
     if (s != NULL) {
         // --- 1. GIỮ NGUYÊN CẤU HÌNH RAW VGA THEO YÊU CẦU CỦA BẠN ---
-        s->set_res_raw(s, 1, 0, 0, 0, 0, 0, 800, 600, 640, 480, false, false);
+        //s->set_res_raw(s, 0, 0, 0, 0, 0, 240, 1280, 240, 1280, 240, false, false);
+        // 👉 GIẢI NÉN MẢNG ĐỂ THIẾT LẬP THAM SỐ ĐỘ PHÂN GIẢI THÔ (RAW) CHO CẢM BIẾN
+        s->set_res_raw(s, 
+                       g_cam_raw_params[0],   // start_x
+                       g_cam_raw_params[1],   // start_y
+                       g_cam_raw_params[2],   // end_x
+                       g_cam_raw_params[3],   // end_y
+                       g_cam_raw_params[4],   // offset_x
+                       g_cam_raw_params[5],   // offset_y
+                       g_cam_raw_params[6],   // total_x
+                       g_cam_raw_params[7],   // total_y
+                       g_cam_raw_params[8],   // output_x
+                       g_cam_raw_params[9],   // output_y
+                       g_cam_raw_params[10] ? true : false,  // scale
+                       g_cam_raw_params[11] ? true : false   // binning
+        );
 
+        ESP_LOGI(TAG, "CAMERA set RAW: %u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u",
+                 g_cam_raw_params[0], g_cam_raw_params[1], g_cam_raw_params[2], g_cam_raw_params[3],
+                 g_cam_raw_params[4], g_cam_raw_params[5], g_cam_raw_params[6], g_cam_raw_params[7],
+                 g_cam_raw_params[8], g_cam_raw_params[9], g_cam_raw_params[10], g_cam_raw_params[11]);
+   
         // --- 2. GIỮ CẤU HÌNH MÀU SẮC ĐẬM NÉT ---
-        s->set_brightness(s, 1);     // Giữ độ sáng phần mềm tối đa (+2)
+        s->set_brightness(s, 0);     // Giữ độ sáng phần mềm tối đa (+2)
         s->set_contrast(s, 1);       
         s->set_saturation(s, 2);     // Giữ màu sắc đậm đà, không bị bệt khi nâng sáng
         s->set_special_effect(s, 0); 
@@ -94,9 +115,9 @@ bool camera_init(esp_video_capture_t* cap)
         s->set_reg(s, 0xd3, 0xff, 0x1F); // Giữ bộ chia xung nhịp ở mức tối đa để chống giật lag
 
         // --- 4. GIẢI PHÁP LÀM SÁNG BỪNG VÙNG NGƯỢC SÁNG VÀ DIỆT SỌC ĐÈN ---
-        s->set_exposure_ctrl(s, 1);  // Bật tự động đo sáng
-        s->set_aec2(s, 1);           // [BẬT LÊN 1]: Kích hoạt mạch AEC2 chuyên dụng để tự động nhận diện và cứu sáng vùng ngược sáng (khuôn mặt)
-        s->set_ae_level(s, 2);       // [TĂNG LÊN 2]: Ép mức trần bù sáng tự động lên cao nhất để đẩy toàn bộ vùng tối sáng lên
+        s->set_exposure_ctrl(s, 0);  // Bật tự động đo sáng
+        s->set_aec2(s, 0);           // [BẬT LÊN 1]: Kích hoạt mạch AEC2 chuyên dụng để tự động nhận diện và cứu sáng vùng ngược sáng (khuôn mặt)
+        s->set_ae_level(s, 0);       // [TĂNG LÊN 2]: Ép mức trần bù sáng tự động lên cao nhất để đẩy toàn bộ vùng tối sáng lên
 
         s->set_reg(s, 0xff, 0xff, 0x01); // Vào Bank 1
         s->set_reg(s, 0x11, 0xff, 0x01); // Giữ tỷ lệ phân tần nội bộ mượt với bộ đệm
@@ -185,10 +206,10 @@ void camera_capture_individual_task(void *pvParameters)
             start_time = xTaskGetTickCount();
             if(shared_frame_buf == NULL || max_len < fb->len)
             {
-                max_len = fb->len;
-                uint8_t* tmp = (uint8_t *)heap_caps_realloc(shared_frame_buf, max_len, MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+                uint8_t* tmp = (uint8_t *)heap_caps_realloc(shared_frame_buf, fb->len, MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
                 if(tmp != NULL)
                 {
+                    max_len = fb->len;
                     shared_frame_buf = tmp;
                     shared_frame_len = max_len; 
                 }
@@ -206,7 +227,7 @@ void camera_capture_individual_task(void *pvParameters)
             retry = 0;
 
             // 2. Chiếm quyền bảo vệ Mutex thật nhanh
-            if (xSemaphoreTake(s_frame_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) 
+            if (xSemaphoreTake(s_frame_mutex, pdMS_TO_TICKS(10000)) == pdTRUE) 
             {
                 memcpy(shared_frame_buf, fb->buf, fb->len);
                 shared_frame_len = fb->len;
@@ -226,7 +247,7 @@ void camera_capture_individual_task(void *pvParameters)
         else
         {
             ESP_LOGE(TAG, "DMA error can not retrieve a frame from PSRAM Queue");
-            vTaskDelay(pdMS_TO_TICKS(10));
+            vTaskDelay(pdMS_TO_TICKS(1000));
         }
     }
 }

@@ -14,6 +14,8 @@ static EventGroupHandle_t s_wifi_event_group;
 #define WIFI_FAIL_BIT      BIT1
 
 #define ALLOWED_MAC_STR     "4c:03:4f:db:2f:27"
+extern volatile bool g_flash_write_requested;
+extern uint16_t g_flash_write_buffer[12];
 
 static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) 
 {
@@ -378,6 +380,8 @@ void video_stream_task(void *pvParameters)
             vTaskDelay(pdMS_TO_TICKS(3000));
             continue;
         }
+
+        esp_wifi_set_max_tx_power(80); // Set max TX power to 80 (0-82 range for ESP32)
         dest_addr.sin_addr.s_addr = target_ip.addr;
 
         // Set Send and Receive timeouts to 3 seconds to prevent permanent hanging
@@ -405,16 +409,7 @@ void video_stream_task(void *pvParameters)
 
             ESP_LOGI(TAG, "TCP CONNECTED. Sending credentials for authentication...");
 
-            // --- STEP 1: AUTHENTICATION HANDSHAKE ---
-            int err = send(sock, AUTH_PASSWORD, strlen(AUTH_PASSWORD), 0);
-            if (err < 0) {
-                ESP_LOGE(TAG, "Failed to transmit password buffer.");
-                close(sock);
-                vTaskDelay(pdMS_TO_TICKS(3000));
-                continue;
-            }
-
-            char rx_buffer[32];
+            char rx_buffer[128];
             memset(rx_buffer, 0, sizeof(rx_buffer));
             int len = recv(sock, rx_buffer, sizeof(rx_buffer) - 1, 0);
 
@@ -425,11 +420,57 @@ void video_stream_task(void *pvParameters)
                 continue;
             }
 
-            if (strstr(rx_buffer, "AUTH_OK") == NULL) {
+            if (strstr(rx_buffer, AUTH_PASSWORD) == NULL)
+            {
                 ESP_LOGE(TAG, "Authentication DENIED by host server. Server response: %s", rx_buffer);
                 close(sock);
                 vTaskDelay(pdMS_TO_TICKS(3000));
                 continue;
+            }
+            else
+            {
+                // Mật khẩu đúng -> Phản hồi tín hiệu xanh cho Python chuyển trạng thái
+                send(sock, "AUTH_OK\n", 8, 0);
+                ESP_LOGI(TAG, "Authentication SUCCESSFUL!");
+
+                // 2. 👉 PARSER BÓC TÁCH VÀ ĐỐI CHIẾU CHUỖI LỆNH RAW NỐI PHÍA SAU
+                char *raw_cmd_ptr = strstr(rx_buffer, "SET_RAW:");
+                if (raw_cmd_ptr != NULL && !g_flash_write_requested)
+                {
+                    uint16_t incoming_array[12];
+                    int parsed = sscanf(raw_cmd_ptr + 8, "%hu,%hu,%hu,%hu,%hu,%hu,%hu,%hu,%hu,%hu,%hu,%hu",
+                                        &incoming_array[0], &incoming_array[1], &incoming_array[2], 
+                                        &incoming_array[3], &incoming_array[4], &incoming_array[5], 
+                                        &incoming_array[6], &incoming_array[7], &incoming_array[8], 
+                                        &incoming_array[9], &incoming_array[10], &incoming_array[11]);
+                    
+                    if (parsed == 12)
+                    {
+                        // Đối chiếu kiểm tra dải miền số an toàn [0 - 2000]
+                        bool valid = true;
+                        for (int i = 0; i < 12; i++)
+                        {
+                            if (incoming_array[i] > 2000)
+                            {
+                                valid = false;
+                                break;
+                            }
+                        }
+
+                        if(incoming_array[0] == 999)
+                        {
+                            esp_restart();
+                        }
+
+                        if (valid)
+                        {
+                            // Thỏa mãn toàn bộ điều kiện -> Gán vào bộ đệm và dựng cờ báo main loop xử lý
+                            memcpy(g_flash_write_buffer, incoming_array, sizeof(g_flash_write_buffer));
+                            g_flash_write_requested = true;
+                            ESP_LOGI(TAG, "✓ [VALID CONFIG] Appended RAW params match format perfectly. Forwarded to main loop.");
+                        }
+                    }
+                }
             }
 
             ESP_LOGI(TAG, "Authentication SUCCESSFUL! Initiating video stream from shared_frame_buf.");
@@ -438,6 +479,7 @@ void video_stream_task(void *pvParameters)
             TickType_t start_time = 0;
             int cnt = 0;
             int error_cnt = 0;  // Track consecutive errors
+            int err = 0;
             fps = 20;  // Set to higher FPS after successful connection
 
             while (1)
@@ -447,7 +489,7 @@ void video_stream_task(void *pvParameters)
                 // Guard against unallocated or empty shared memory
                 if (shared_frame_buf == NULL || shared_frame_len == 0) {
                     ESP_LOGI(TAG, "Shared frame buffer is empty or unallocated. Waiting...");
-                    vTaskDelay(pdMS_TO_TICKS(100));
+                    vTaskDelay(pdMS_TO_TICKS(1000));
                     continue;
                 }
 
