@@ -32,6 +32,7 @@
 #define WIFI_SSID_ACESS     "LT29"
 #define WIFI_PASS_ACESS     "vcld1876317"
 #define SERVER_PORT_ACCESS   1357
+#define CONTROL_PORT_ACCESS  1358   // Kênh điều khiển thông số camera (Python -> ESP32)
 #define AUTH_PASSWORD       "pass187631\n"
 #define UDP_BROADCAST_PORT   5005 
 
