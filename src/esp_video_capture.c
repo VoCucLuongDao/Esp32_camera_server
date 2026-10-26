@@ -55,8 +55,8 @@ bool camera_init(esp_video_capture_t* cap)
     cap->config.pin_sccb_scl   = SIOC_GPIO_NUM;
     cap->config.pin_pwdn       = PWDN_GPIO_NUM;
     cap->config.pin_reset      = RESET_GPIO_NUM;
-    cap->config.xclk_freq_hz   = 10000000;          //24MHZ
-
+    cap->config.xclk_freq_hz   = 20000000;          //24MHZ
+    
     // Cấu hình định dạng và nén bằng phần cứng
     cap->config.pixel_format   = PIXFORMAT_JPEG;
     cap->config.frame_size     = FRAMESIZE_SVGA;       // 1280x720
@@ -102,6 +102,8 @@ bool camera_init(esp_video_capture_t* cap)
    
         // --- 2. GIỮ CẤU HÌNH MÀU SẮC ĐẬM NÉT ---
         s->set_brightness(s, 0);     // Giữ độ sáng phần mềm tối đa (+2)
+        // --- 2. GIỮ CẤU HÌNH MÀU SẮC ĐẬM NÉT ---
+        s->set_brightness(s, 1);     // Giữ độ sáng phần mềm tối đa (+2)
         s->set_contrast(s, 1);       
         s->set_saturation(s, 2);     // Giữ màu sắc đậm đà, không bị bệt khi nâng sáng
         s->set_special_effect(s, 0); 
