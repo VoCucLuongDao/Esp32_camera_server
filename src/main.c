@@ -48,6 +48,6 @@ void app_main(void)
     while(1)
     {
 
-        vTaskDelay(pdMS_TO_TICKS(1000)); // Quét định kỳ cờ hiệu sau mỗi 100ms
+        vTaskDelay(pdMS_TO_TICKS(1000)); // app_main không cần làm gì: các task tự chạy
     }
 }

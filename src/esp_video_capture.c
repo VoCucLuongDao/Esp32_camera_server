@@ -75,6 +75,14 @@ extern uint16_t g_cam_raw_params[12];
 #define OV3660_REG_AEC_PK_GAIN_H2     0x350A   /* gain[9:8]  (OV3660) */
 #define OV3660_REG_AEC_PK_GAIN_L2     0x350B   /* gain[7:0]  (OV3660) */
 #define OV3660_REG_AGC_GAIN_CEILING   0x3A18   /* 0x3A18[9:8] + 0x3A19[7:0] */
+#define OV3660_REG_AEC_MAX_EXPO_H     0x3A02   /* AEC max exposure[15:8] */
+#define OV3660_REG_AEC_MAX_EXPO_L     0x3A03   /* AEC max exposure[7:0]  */
+#define OV3660_REG_AEC_MAX_EXPO2_H    0x3A14   /* AEC max exposure 50 Hz */
+#define OV3660_REG_AEC_MAX_EXPO2_L    0x3A15
+#define OV3660_REG_HTS_H              0x380C   /* HTS - tổng pixel 1 dòng */
+#define OV3660_REG_HTS_L              0x380D
+#define OV3660_REG_VTS_H              0x380E   /* VTS - tổng dòng 1 frame */
+#define OV3660_REG_VTS_L              0x380F
 /* 0x3508/0x3509 là gain của OV2640 — KHÔNG dùng cho OV3660 */
 #define OV3660_REG_LIGHT_DETECT0      0x3C1B
 #define OV3660_REG_LIGHT_DETECT1      0x3C1C
@@ -179,6 +187,10 @@ static const ov3660_ratio_t s_ratio_table[] = {
 #define CUSTOM_W_MAX 2048
 #define CUSTOM_H_MIN   96
 #define CUSTOM_H_MAX 1536
+
+/* Buffer JPEG tối đa cho 1 frame: driver dùng w*h/5 (xem cam_hal.c).
+ * 2048x1536 / 5 ≈ 629 KB -> đủ cho cả khung tuỳ chỉnh lớn nhất. */
+#define OV3660_JPEG_BUF_MAX (CUSTOM_W_MAX * CUSTOM_H_MAX / 5)
 
 /* Áp kích thước tuỳ chỉnh.
  *
@@ -293,8 +305,9 @@ static void ov3660_apply_config(sensor_t *s, const cam_config_t *c, bool dump)
         ESP_LOGI(TAG, "Applying OV3660 register configuration...");
 
     /* --- 1. ĐIỀU KHIỂN HỆ THỐNG (0x3008, 0x303A-0x303D, 0x3100) ---
-     * Chỉ ĐỌC để xác nhận: PLL do driver tính từ xclk_freq_hz, ghi đè sẽ làm
-     * sai tần số PCLK và hỏng luồng DMA. */
+     * Chỉ ĐỌC để xác nhận. PLL do driver tính từ xclk_freq_hz và chỉ đặt trong
+     * esp_camera_init()/set_framesize(); firmware KHÔNG ghi đè PLL giữa lúc
+     * stream (xem giải thích ở OV3660_PCLK_HZ và camera_apply_cfg). */
     ov3660_dump_reg(s, OV3660_REG_PID_H,            "PID high (expect 0x36)");
     ov3660_dump_reg(s, OV3660_REG_PID_L,            "PID low  (expect 0x60)");
     ov3660_dump_reg(s, OV3660_REG_SYSTEM_CTROL0,    "SYSTEM_CTROL0");
@@ -333,8 +346,8 @@ static void ov3660_apply_config(sensor_t *s, const cam_config_t *c, bool dump)
     ov3660_dump_reg(s, OV3660_REG_SCALE_CTRL_01,    "SCALE_CTRL_01");
 
     /* --- 5. AEC / AGC / ISP (0x3503, 0x5001, 0x503D, 0x3C1B-0x3C1D) ---
-     * 0x3503 bit0 = AEC manual, bit1 = AGC manual. Khi khoá thủ công thì ghi
-     * trực tiếp cặp thanh ghi 16-bit: exposure 0x3501/0x3502, gain 0x3508/0x3509. */
+     * 0x3503 bit0 = AEC manual, bit1 = AGC manual. Khi khoá thủ công, driver
+     * ghi exposure 0x3500/0x3501/0x3502 và gain 0x350A/0x350B (layout OV3660). */
     if (c != NULL) {
         uint8_t manual = (c->aec ? 0x00 : 0x01) | (c->agc ? 0x00 : 0x02);
         s->set_reg(s, OV3660_REG_AEC_PK_MANUAL, 0x03, manual);
@@ -343,7 +356,7 @@ static void ov3660_apply_config(sensor_t *s, const cam_config_t *c, bool dump)
          *   exposure = {0x3500[3:0], 0x3501[7:0], 0x3502[7:0]}
          *   gain     = {0x350A[1:0], 0x350B[7:0]} / 16
          * Driver đã ghi đúng layout này trong set_aec_value()/set_agc_gain()
-         * (camera_apply_cfg gọi sẵn). Ghi tay 0x3501/0x3508 như OV2640 sẽ
+         * (camera_apply_cfg gọi sẵn). Ghi tay kiểu OV2640 (0x3501/0x3508) sẽ
          * làm exposure/gain sai hoàn toàn, nên ở đây không ghi nữa. */
     }
 
@@ -429,15 +442,15 @@ void camera_config_defaults(void)
         s_cfg_mutex = xSemaphoreCreateMutex();
 
     cam_config_t d = {
-        .brightness   = 1,              // nâng nhẹ vùng tối (cảnh thiếu sáng/ban đêm)
-        .contrast     = 1,              // tăng nhẹ để khối mặt rõ hơn, không bệt
+        .brightness   = 0,              // không nâng số vùng tối gây lộ nhiễu
+        .contrast     = 0,              // giữ mức trung tính
         .saturation   = 1,
-        .sharpness    = 2,              // làm nét mạnh: lấy lại chi tiết mặt/mép
-        .ae_level     = 2,              // đẩy mục tiêu đo sáng lên -> ảnh sáng hơn
-        .denoise      = 3,              // vừa phải: khử nhiễu 4+ làm nhoè cả khuôn mặt
-        .quality      = 6,              // JPEG nét hơn (số nhỏ = chất lượng cao)
+        .sharpness    = 0,              // tăng nét làm hạt nhiễu dễ thấy hơn
+        .ae_level     = 0,              // đo sáng trung tính
+        .denoise      = 5,              // khử nhiễu mạnh hơn cho môi trường đủ sáng
+        .quality      = 12,             // JPEG vừa: số nhỏ = nét hơn nhưng frame nặng hơn
         .framesize    = FRAMESIZE_XGA,  // 1024x768 (binning 2x2 -> nhạy sáng gấp 4)
-        .gainceiling  = 5,              // Gain 64X: đủ sáng cho phòng tối/ban đêm
+        .gainceiling  = 0,              // Giới hạn gain ở mức 2x để giảm nhiễu
         .wb_mode      = 0,              // auto white balance
         .effect       = 0,              // không hiệu ứng
         .hmirror      = 0,
@@ -450,7 +463,8 @@ void camera_config_defaults(void)
         .wpc          = 1,              // sửa điểm ảnh trắng
         .lenc         = 1,              // bù sáng viền ống kính
         .raw_gma      = 1,
-        .fps          = 10,             // thiếu sáng vốn chỉ được vài fps: giảm tải WiFi
+        .fps          = 5,              // mục tiêu gần mức tối đa ~5,5 fps ở XGA;
+                                        // thiếu sáng có thể giảm FPS hoặc tối ảnh.
         .custom       = 0,              // tắt: dùng bảng độ phân giải chuẩn
         .width        = 1024,           // chỉ dùng khi custom = 1
         .height       = 768,
@@ -539,12 +553,99 @@ static uint16_t gainceiling_code(int level)
     return codes[clamp_int(level, 0, 6)];
 }
 
+/* PCLK thực tế do driver ov3660.c đặt khi xclk = 20 MHz.
+ *
+ * FPS của cảm biến = PCLK / (HTS * VTS). Với xclk 12 MHz, driver đặt PCLK chỉ
+ * 6 MHz -> XGA (HTS 2300, VTS 783) được ~3,3 fps, còn khi AEC phơi sáng dài
+ * (trần 2352 dòng) thì tụt còn ~1 fps. Với xclk 20 MHz, driver đặt PCLK
+ * 10 MHz -> XGA được ~5,5 fps (khung nhỏ hơn thì binning cho FPS cao hơn).
+ *
+ * BÀI HỌC TỪ BOARD THẬT: KHÔNG ghi đè PLL/set_framesize khi camera đang stream.
+ * Trước đây firmware gọi set_pll() ngay sau set_framesize() (và esp_camera_init
+ * lại đổi framesize lúc đang chạy) -> xung PCLK đổi giữa frame làm khối JPEG +
+ * DMA mất đồng bộ. Biểu hiện:
+ *   - PCLK 20 MHz: NO-SOI liên tục (frame rác) + timeout
+ *   - PCLK 12,5 MHz: không frame nào
+ *   - PCLK 13,3 MHz: chỉ 1 frame "HD" cũ rồi đứng, watchdog init lại liên tục
+ * Giờ driver tự chọn PLL (PCLK 10 MHz) và chỉ đổi độ phân giải bằng cách init
+ * lại camera (xem vòng capture), nên không còn thay đổi xung giữa frame.
+ *
+ * Muốn FPS cao hơn nữa thì phải chấp nhận rủi ro trên: tăng pclk_div trong
+ * driver hoặc hạ độ phân giải (VGA/QVGA cho binning). */
+#define OV3660_PCLK_HZ  10000000UL   /* PCLK driver chọn cho xclk 20 MHz */
+
+/* Giới hạn phơi sáng tối đa của AEC theo FPS mong muốn.
+ *
+ * AEC của OmniVision luôn ưu tiên tăng exposure trước khi tăng gain, nên dù
+ * trần gain đã là ~64x, trời tối nó vẫn phơi tới trần 2352 dòng -> 1-2 fps.
+ * Ghi 0x3A02/0x3A03 = PCLK / (HTS * fps) để chặn exposure đúng mốc thời gian
+ * 1/fps; phần thiếu sáng do gain bù. fps càng nhỏ -> phơi càng lâu -> càng sáng.
+ *
+ * fps ở đây bị chặn trên bởi FPS thật của cảm biến (PCLK/(HTS*VTS)): đặt FPS
+ * cao hơn mức cảm biến làm được thì chỉ làm phơi sáng ngắn lại (tối ảnh) chứ
+ * không nhanh thêm. Nhờ vậy thanh trượt FPS chỉ cắt sáng khi thực sự đổi được
+ * nhịp.
+ *
+ * CỐ Ý KHÔNG chặn `lines` theo VTS: OV3660 cho phép exposure dài hơn 1 frame
+ * (trần 2352 dòng ≈ 3 frame XGA). Khi exposure > VTS, cảm biến tự kéo dài
+ * frame (FPS giảm đúng như đặt) và ảnh sáng hơn hẳn — đây chính là mục đích
+ * của thanh FPS khi chụp đêm. Chặn ở VTS-4 (cách cũ) làm đặt FPS 2-4 vẫn chỉ
+ * phơi được 779 dòng như 5 fps, tức là giảm FPS mà không sáng thêm.
+ * Trả về số dòng đã ghi (để hiện trong STAT). */
+static int ov3660_limit_exposure(sensor_t *s, int fps)
+{
+    if (s == NULL)
+        return 0;
+
+    int hh = s->get_reg(s, OV3660_REG_HTS_H, 0xFF);
+    int hl = s->get_reg(s, OV3660_REG_HTS_L, 0xFF);
+    int hts = (hh < 0 || hl < 0) ? 0 : (((hh & 0xFF) << 8) | (hl & 0xFF));
+    if (hts <= 0)
+        hts = 2300;                       /* giá trị của ratio_table 4:3 */
+
+    int vh = s->get_reg(s, OV3660_REG_VTS_H, 0xFF);
+    int vl = s->get_reg(s, OV3660_REG_VTS_L, 0xFF);
+    int vts = (vh < 0 || vl < 0) ? 0 : (((vh & 0xFF) << 8) | (vl & 0xFF));
+    if (vts <= 0)
+        vts = 783;                        /* XGA trong ov3660_settings.h */
+
+    if (fps < 1)
+        fps = 1;
+
+    /* FPS tối đa cảm biến đạt được với timing hiện tại (làm tròn xuống). */
+    int sensor_fps = (int)(OV3660_PCLK_HZ / ((uint32_t)hts * (uint32_t)vts));
+    if (sensor_fps < 1)
+        sensor_fps = 1;
+    if (fps > sensor_fps)
+        fps = sensor_fps;
+
+    uint32_t lines = OV3660_PCLK_HZ / ((uint32_t)hts * (uint32_t)fps);
+    if (lines < 8)
+        lines = 8;                        /* dưới mức này AEC không ổn định */
+    if (lines > 2352)
+        lines = 2352;                     /* trần mặc định của ov3660_settings.h
+                                           * (~0,54 s ở PCLK 10 MHz, HTS 2300) */
+
+    s->set_reg(s, OV3660_REG_AEC_MAX_EXPO_H, 0xFF, (int)((lines >> 8) & 0xFF));
+    s->set_reg(s, OV3660_REG_AEC_MAX_EXPO_L, 0xFF, (int)(lines & 0xFF));
+    /* Một số chế độ AEC (50 Hz / night) dùng cặp 0x3A14/0x3A15 — đặt cùng giá
+     * trị để trần phơi sáng có hiệu lực trong mọi chế độ. */
+    s->set_reg(s, OV3660_REG_AEC_MAX_EXPO2_H, 0xFF, (int)((lines >> 8) & 0xFF));
+    s->set_reg(s, OV3660_REG_AEC_MAX_EXPO2_L, 0xFF, (int)(lines & 0xFF));
+    return (int)lines;
+}
+
 /* Áp toàn bộ cấu hình vào sensor. Chỉ được gọi từ task capture.
- * Chỉ ghi lại các trường thực sự thay đổi để không làm giật hình khi kéo slider. */
+ * Chỉ ghi lại các trường thực sự thay đổi để không làm giật hình khi kéo slider.
+ *
+ * geometry_done = true khi driver VỪA được esp_camera_init() ở đúng framesize
+ * của cấu hình này. Khi đó bỏ qua set_framesize(): đổi framesize/PLL giữa lúc
+ * camera đang stream làm khối JPEG + DMA mất đồng bộ (NO-SOI / 0 frame), nên
+ * mọi thay đổi độ phân giải phải đi qua init lại camera (xem vòng capture). */
 static cam_config_t s_applied_cfg;
 static bool s_applied_valid = false;
 
-static void camera_apply_cfg(sensor_t *s, const cam_config_t *c)
+static void camera_apply_cfg(sensor_t *s, const cam_config_t *c, bool geometry_done)
 {
     if (s == NULL || c == NULL) return;
 
@@ -556,17 +657,20 @@ static void camera_apply_cfg(sensor_t *s, const cam_config_t *c)
     const cam_config_t *p = s_applied_valid ? &s_applied_cfg : NULL;
 #define CFG_CHANGED(field) (p == NULL || p->field != c->field)
 
-    ESP_LOGI(TAG, "Apply config: fs=%d q=%d b=%d c=%d s=%d ae=%d sh=%d dn=%d gc=%d wb=%d fx=%d hm=%d vf=%d aec=%d agc=%d fps=%d custom=%d %dx%d",
+    ESP_LOGI(TAG, "Apply config: fs=%d q=%d b=%d c=%d s=%d ae=%d sh=%d dn=%d gc=%d wb=%d fx=%d hm=%d vf=%d aec=%d agc=%d fps=%d custom=%d %dx%d%s",
              c->framesize, c->quality, c->brightness, c->contrast, c->saturation,
              c->ae_level, c->sharpness, c->denoise, c->gainceiling, c->wb_mode,
              c->effect, c->hmirror, c->vflip, c->aec, c->agc, c->fps,
-             c->custom, c->width, c->height);
+             c->custom, c->width, c->height,
+             geometry_done ? " (geometry do driver dat luc init)" : "");
 
     // 1. Kích thước khung hình: hoặc theo bảng chuẩn (framesize), hoặc theo
     //    kích thước tuỳ chỉnh (width x height) do người dùng nhập trên UI.
     //    Đổi custom/width/height cũng phải áp lại nên gộp chung điều kiện.
-    if (CFG_CHANGED(framesize) || CFG_CHANGED(custom) ||
-        CFG_CHANGED(width)     || CFG_CHANGED(height))
+    bool geometry_changed = !geometry_done &&
+                            (CFG_CHANGED(framesize) || CFG_CHANGED(custom) ||
+                             CFG_CHANGED(width)     || CFG_CHANGED(height));
+    if (geometry_changed)
     {
         if (c->custom)
         {
@@ -583,6 +687,14 @@ static void camera_apply_cfg(sensor_t *s, const cam_config_t *c)
             ESP_LOGI(TAG, "Frame size preset #%d -> %dx%d",
                      fs, s_stats.out_w, s_stats.out_h);
         }
+    }
+    else if (!c->custom)
+    {
+        /* Kích thước đã do driver đặt lúc init; chỉ đồng bộ số liệu cho STAT. */
+        int fs = (c->framesize >= 0 && c->framesize < FRAMESIZE_INVALID)
+                 ? c->framesize : FRAMESIZE_XGA;
+        s_stats.out_w = resolution[fs].width;
+        s_stats.out_h = resolution[fs].height;
     }
 
     // 2. Chất lượng nén JPEG (0x4407 bit[5:0])
@@ -618,18 +730,32 @@ static void camera_apply_cfg(sensor_t *s, const cam_config_t *c)
     if (CFG_CHANGED(aec))
         s->set_exposure_ctrl(s, c->aec ? 1 : 0);
     if (!c->aec && CFG_CHANGED(aec_value))
-        s->set_aec_value(s, c->aec_value);      // 0x3501/0x3502
+        s->set_aec_value(s, c->aec_value);      // 0x3500/0x3501/0x3502
     if (CFG_CHANGED(agc))
         s->set_gain_ctrl(s, c->agc ? 1 : 0);
     if (!c->agc && CFG_CHANGED(agc_gain))
-        s->set_agc_gain(s, c->agc_gain);        // 0x3508/0x3509
+        s->set_agc_gain(s, c->agc_gain);        // 0x350A/0x350B
 
-    // 7. Ghi trực tiếp thanh ghi 0x3501/0x3502, 0x3508/0x3509 khi khoá thủ công
-    //    + đọc lại toàn bộ thanh ghi chính ra log để kiểm chứng
+    // 7. Đọc lại toàn bộ thanh ghi chính ra log để kiểm chứng cấu hình
+    //    (exposure/gain thủ công do driver ghi đúng layout OV3660 ở trên)
     ov3660_apply_config(s, c, p == NULL);
 
+    /* 7b. Chặn phơi sáng dài làm tụt FPS: đặt trần AEC theo fps gửi frame.
+     *     1 fps -> phơi tối đa (2352 dòng, ưu tiên sáng); 10 fps -> phơi ngắn,
+     *     AGC bù bằng gain. Phải làm sau ov3660_apply_config để không bị ghi đè. */
+    if (geometry_changed || CFG_CHANGED(fps))
+    {
+        int max_lines = ov3660_limit_exposure(s, c->fps);
+        int rh = s->get_reg(s, OV3660_REG_AEC_MAX_EXPO_H, 0xFF);
+        int rl = s->get_reg(s, OV3660_REG_AEC_MAX_EXPO_L, 0xFF);
+        int rb = (rh < 0 || rl < 0) ? -1 : (((rh & 0xFF) << 8) | (rl & 0xFF));
+        s_stats.aec_max = max_lines;
+        ESP_LOGI(TAG, "AEC max exposure = %d dong (doc lai %d, fps=%d, PCLK=%lu Hz)",
+                 max_lines, rb, c->fps, (unsigned long)OV3660_PCLK_HZ);
+    }
+
     // 8. Tốc độ gửi frame (dùng chung cho task capture và task mạng)
-    fps = (uint8_t)((c->fps > 0 && c->fps <= 30) ? c->fps : 20);
+    fps = (uint8_t)((c->fps > 0 && c->fps <= 30) ? c->fps : 10);
 
     s_applied_cfg = *c;
     s_applied_valid = true;
@@ -683,86 +809,121 @@ bool camera_init(esp_video_capture_t* cap)
     cap->config.pin_sccb_scl   = SIOC_GPIO_NUM;
     cap->config.pin_pwdn       = PWDN_GPIO_NUM;
     cap->config.pin_reset      = RESET_GPIO_NUM;
-    cap->config.xclk_freq_hz   = 12000000;          //24MHZ
+    cap->config.xclk_freq_hz   = 20000000;         // 20 MHz (chuẩn OV3660): driver tự đặt PLL
+                                                   // cho PCLK 10 MHz -> XGA ~5,5 fps
     
     // Cấu hình định dạng và nén bằng phần cứng
     cap->config.pixel_format   = PIXFORMAT_JPEG;
-    /* Kích thước lúc init quyết định KÍCH THƯỚC BUFFER của driver:
-     *   cam_hal.c -> recv_size = width * height / 5 (JPEG), fb_size = recv_size
-     * Vì UI cho phép đặt kích thước tuỳ chỉnh (tối đa 2048x1536), phải init ở
-     * QXGA để 2 frame buffer đủ chỗ cho khung lớn nhất (2 x 629 KB PSRAM).
-     * Kích thước thật sẽ được đặt lại ngay sau đó bởi camera_apply_cfg()
-     * (mặc định XGA 1024x768). */
-    cap->config.frame_size     = FRAMESIZE_HD;      // 2048x1536 - mức buffer tối đa
-    cap->config.jpeg_quality   = 8;                 // Tối ưu cân bằng dung lượng/băng thông mạng
+    /* Kích thước buffer JPEG của driver (cam_hal.c) được quyết định lúc init:
+     *   recv_size = jpeg_buffer_size (nếu > 0) hoặc width*height/5
+     * UI cho phép đặt khung tuỳ chỉnh tới 2048x1536, nên đặt thẳng
+     * jpeg_buffer_size = 2048*1536/5 ≈ 629 KB cho frame buffer duy nhất
+     * (fb_count=1 -> ~629 KB PSRAM, tiết kiệm ~630 KB so với fb_count=2).
+     * Nhờ vậy khung lớn không bị driver cắt ("DMA overflow").
+     *
+     * frame_size phải đặt ĐÚNG độ phân giải đang cấu hình NGAY TỪ esp_camera_init():
+     * driver gọi set_framesize() + set_pll() bên trong init. Nếu để HD rồi đổi
+     * framesize sau khi đã stream (cách cũ) thì PCLK đổi giữa frame, khối JPEG
+     * + DMA mất đồng bộ -> chỉ còn 1 frame cũ rồi đứng (watchdog init lại liên
+     * tục) hoặc NO-SOI. Đây chính là lỗi "restart liên tục" trên board thật. */
+    cam_config_t boot_cfg;
+    camera_config_get(&boot_cfg);
+    cam_config_sanitize(&boot_cfg);
+    int boot_fs = (boot_cfg.framesize >= 0 && boot_cfg.framesize < FRAMESIZE_INVALID)
+                  ? boot_cfg.framesize
+                  : FRAMESIZE_XGA;
+    cap->config.frame_size       = (framesize_t)boot_fs;   // driver dựng đúng ngay từ init
+    cap->config.jpeg_buffer_size = OV3660_JPEG_BUF_MAX;
+    cap->config.jpeg_quality     = boot_cfg.quality;  // dùng cùng chất lượng với cấu hình khởi động
 
     // Chiến lược quản lý Bộ đệm DMA nâng cao trên PSRAM
     cap->config.fb_location    = CAMERA_FB_IN_PSRAM; // Ép buộc lưu trên PSRAM
-    cap->config.fb_count       = 2;                  // Bật chế độ Ping-Pong DMA
+    cap->config.fb_count       = 1;                  // 1 buffer: tắt Ping-Pong DMA
+                                                     // (đỡ 1 buffer PSRAM, heap +~630 KB)
     cap->config.grab_mode      = CAMERA_GRAB_LATEST;  // CHỈ LẤY KHUNG HÌNH MỚI NHẤT, vứt bỏ khung hình lỗi mất EOI
 
     // Khởi tạo driver camera phần cứng (Kích hoạt EDMA/LCD_CAM DMA)
     esp_err_t err = esp_camera_init(&cap->config);
     if (err != ESP_OK) {
-        /* QXGA cần 2 x ~629 KB PSRAM. Board thiếu PSRAM / PSRAM lỗi thì lùi về
-         * XGA để camera vẫn chạy. Khi đó khung tuỳ chỉnh lớn hơn buffer sẽ bị
-         * driver bỏ (không crash) - xem giải thích ở camera_init(). */
-        ESP_LOGW(TAG, "Init FRAMESIZE_QXGA that bai (0x%x) - thu lai voi XGA", err);
-        cap->config.frame_size = FRAMESIZE_XGA;
+        /* Buffer JPEG tối đa cần ~629 KB PSRAM (1 frame). Board thiếu PSRAM /
+         * PSRAM lỗi thì lùi về buffer mặc định của XGA để camera vẫn chạy.
+         * Khi đó khung tuỳ chỉnh lớn hơn buffer sẽ bị driver bỏ (không crash). */
+        ESP_LOGW(TAG, "Init voi buffer JPEG toi da that bai (0x%x) - thu lai XGA", err);
+        cap->config.frame_size       = FRAMESIZE_XGA;
+        cap->config.jpeg_buffer_size = 0;   // để driver tự tính width*height/5
         err = esp_camera_init(&cap->config);
     }
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Camera initialization is failured: 0x%x", err);
+        ESP_LOGE(TAG, "Camera initialization failed: 0x%x", err);
         s_cam_ok = false;
         cap->is_opened = false;
         return false;
     }
     s_cam_ok = true;
 
+    /* Driver vừa reset toàn bộ cảm biến về mặc định (kể cả khi đây là lần
+     * init lại sau lỗi DMA). Bắt buộc áp lại từ đầu: trần gain, trần phơi
+     * sáng, chất lượng JPEG... Nếu giữ s_applied_valid = true thì
+     * camera_apply_cfg() tưởng cấu hình không đổi và bỏ qua. */
+    s_applied_valid = false;
+
    sensor_t *s = esp_camera_sensor_get();
     if (s != NULL) {
 
-                // 1. BẬT TỰ ĐỘNG ĐỂ CAMERA TỰ CÂN BẰNG ĐỘ SÁNG THEO MÔI TRƯỜNG
+        // BẬT TỰ ĐỘNG ĐỂ CAMERA TỰ CÂN BẰNG ĐỘ SÁNG THEO MÔI TRƯỜNG
         s->set_exposure_ctrl(s, 1);  
         s->set_gain_ctrl(s, 1);      
-        s->set_aec2(s, 1);           
+        s->set_aec2(s, 0);            // tắt chế độ ban đêm trong cấu hình mặc định
 
-        // 2. ĐO SÁNG + MỞ RỘNG TRẦN GAIN CHO ĐIỀU KIỆN THIẾU SÁNG
-        //    Ảnh ban đêm tối thường do AEC đã phơi sáng tối đa nhưng bị chặn
-        //    gain ở 8X. Nâng lên mức tối đa của cảm biến (~64X) để phòng tối vẫn
-        //    nhìn thấy hình; khử nhiễu mức 3 bù lại hạt do gain cao mà không nhoè mặt.
-        s->set_ae_level(s, 2);                    // đẩy mục tiêu đo sáng lên
-        /* Ghi thẳng 0x3A18/0x3A19 = 0x3FF (~64X). Không dùng
+        // 2. ĐO SÁNG + GIỚI HẠN GAIN THEO CẤU HÌNH KHỞI ĐỘNG
+        s->set_ae_level(s, boot_cfg.ae_level);
+        /* Ghi trực tiếp 0x3A18/0x3A19 theo cấu hình. Không dùng
          * s->set_gainceiling() vì driver ghi sai đơn vị (xem gainceiling_code). */
-        s->set_reg(s, OV3660_REG_AGC_GAIN_CEILING, 0x3FF, gainceiling_code(5));
+        s->set_reg(s, OV3660_REG_AGC_GAIN_CEILING, 0x3FF,
+                   gainceiling_code(boot_cfg.gainceiling));
 
         // 3. CHUYỂN SANG ĐO SÁNG TOÀN KHUNG HÌNH (AVERAGE METERING)
         // 👉 OV3660 KHÔNG có bank 0xFF/0x13 như OV2640. Việc đo sáng được điều
         //    khiển qua ae_level + khối AEC và các thanh ghi 0x3C1B-0x3C1D.
         //    Toàn bộ cấu hình thanh ghi nằm trong ov3660_apply_config().
 
-        // 4. ĐỘ NÉT + KHỬ NHIỄU (ưu tiên mặt/chi tiết rõ, chấp nhận ít hạt)
+        // 4. ĐỘ NÉT + KHỬ NHIỄU THEO CẤU HÌNH KHỞI ĐỘNG
         s->set_whitebal(s, 1);       
         s->set_wb_mode(s, 0);        
-        s->set_brightness(s, 1);     
-        s->set_contrast(s, 1);       // khối mặt rõ hơn
-        s->set_saturation(s, 1);     
-        s->set_sharpness(s, 2);      // làm nét mạnh (driver cho -3..3)
-        s->set_denoise(s, 3);        // 4+ làm nhoè chi tiết mặt
+        s->set_brightness(s, boot_cfg.brightness);
+        s->set_contrast(s, boot_cfg.contrast);
+        s->set_saturation(s, boot_cfg.saturation);
+        s->set_sharpness(s, boot_cfg.sharpness);
+        s->set_denoise(s, boot_cfg.denoise);
 
         vTaskDelay(pdMS_TO_TICKS(1500)); 
 
         // 5. ÁP DỤNG CẤU HÌNH TỪ KHO CHUNG (mặc định, có thể chỉnh từ xa qua TCP)
         cam_config_t cfg;
         camera_config_get(&cfg);
-        camera_apply_cfg(s, &cfg);
+        cam_config_sanitize(&cfg);
+        /* Nếu esp_camera_init đã dựng đúng framesize chuẩn này thì KHÔNG gọi
+         * set_framesize() nữa (tránh đổi PLL/xung giữa lúc DMA đang chạy). */
+        bool geometry_done = (!cfg.custom &&
+                              (int)cap->config.frame_size == cfg.framesize);
+        camera_apply_cfg(s, &cfg, geometry_done);
         camera_config_take_pending(&cfg);   // đã áp dụng xong -> xoá cờ dirty
 
         // 6. Giữ con trỏ sensor cho task capture dùng lại khi có cấu hình mới
         s_sensor = s;
     }
 
-    ESP_LOGI(TAG, "Camera initialization is sucessfull (Resolution: HD, Storge: PSRAM)");
+    ESP_LOGI(TAG, "Camera initialization successful (Resolution: %dx%d, Storage: PSRAM)",
+             s_stats.out_w, s_stats.out_h);
+
+    /* Banner để chắc chắn firmware đang chạy là bản mới nhất (xem log boot):
+     * PCLK + hệ số chia, số frame buffer, kích thước buffer JPEG và watchdog
+     * phục hồi camera. Nếu các số này khác mong đợi thì bản nạp chưa đúng. */
+    ESP_LOGI(TAG, "BUILD: PCLK=%lu Hz (driver tu chon PLL) | fb_count=%d | "
+             "JPEG buf=%u B | watchdog no-frame 4000 ms",
+             (unsigned long)OV3660_PCLK_HZ,
+             (int)cap->config.fb_count, (unsigned)cap->config.jpeg_buffer_size);
+
     cap->is_opened = true;
     return true;
 }
@@ -818,6 +979,11 @@ void camera_capture_individual_task(void *pvParameters)
     ESP_LOGI("CAM_TASK", "Individual Capture Task start working at Core 0.");
     TickType_t latest_time = xTaskGetTickCount();
     TickType_t frame_tick  = xTaskGetTickCount();
+    /* Mốc frame hợp lệ gần nhất. Dùng để phát hiện "camera im lặng" theo THỜI
+     * GIAN thay vì đếm số lần lỗi: fb_get() đã chờ 4 s mỗi lần nên đếm lỗi
+     * không đáng tin (một frame lọt vào giữa các lần lỗi sẽ reset bộ đếm và
+     * camera có thể kẹt ở 0,1 fps mà không bao giờ tự khởi tạo lại). */
+    TickType_t last_ok_tick = xTaskGetTickCount();
 
     // Buffer đích dùng chung với task mạng: cấp phát động, KHÔNG dùng biến 16-bit
     // cho kích thước (frame XGA có thể > 65535 byte -> trước đây bị cắt cụt JPEG).
@@ -834,7 +1000,33 @@ void camera_capture_individual_task(void *pvParameters)
         //    SCCB/sensor đều nằm trong task capture (không tranh chấp với task mạng)
         if (s_sensor != NULL && camera_config_take_pending(&pending))
         {
-            camera_apply_cfg(s_sensor, &pending);
+            /* Đổi ĐỘ PHÂN GIẢI (framesize/custom/width/height) KHÔNG được gọi
+             * set_framesize() giữa lúc đang stream: driver đổi luôn PLL/PCLK,
+             * khối JPEG + DMA mất đồng bộ -> NO-SOI hoặc chỉ còn 1 frame cũ
+             * rồi đứng (watchdog init lại mãi). Cách đúng: deinit rồi init lại
+             * để driver dựng cảm biến + DMA từ đầu ở độ phân giải mới. */
+            bool geo_change = s_applied_valid &&
+                              (pending.custom      != s_applied_cfg.custom ||
+                               pending.framesize   != s_applied_cfg.framesize ||
+                               (pending.custom &&
+                                (pending.width  != s_applied_cfg.width ||
+                                 pending.height != s_applied_cfg.height)));
+            if (geo_change)
+            {
+                ESP_LOGW(TAG, "Doi do phan giai -> khoi tao lai camera (dong bo JPEG/DMA)");
+                video_capture_close(&cap);
+                shared_frame_len = 0;
+                while (!camera_init(&cap))
+                {
+                    ESP_LOGE(TAG, "Khoi tao lai camera that bai - thu lai sau 5 giay");
+                    vTaskDelay(pdMS_TO_TICKS(5000));
+                }
+                last_ok_tick = xTaskGetTickCount();
+                frame_tick   = last_ok_tick;
+                continue;
+            }
+
+            camera_apply_cfg(s_sensor, &pending, false);
             frame_tick = xTaskGetTickCount();
         }
 
@@ -849,6 +1041,7 @@ void camera_capture_individual_task(void *pvParameters)
         if (video_capture_read(&cap, &fb))
         {
             read_fail = 0;
+            last_ok_tick = xTaskGetTickCount();
             // 1.1 Frame phải bắt đầu bằng SOI (FF D8). Ngay sau khi đổi
             //     framesize/JPEG quality, driver có thể trả buffer chưa kịp
             //     mã hoá ("NO-SOI") -> gửi lên client sẽ chỉ thấy ảnh đen.
@@ -907,7 +1100,7 @@ void camera_capture_individual_task(void *pvParameters)
             // 3. Nhịp chạy: có client -> đúng FPS trên UI, không có -> 1 fps.
             //    xTaskDelayUntil tự bỏ qua nếu capture đã chậm hơn nhịp này.
             uint32_t period_ms = s_stream_active
-                                 ? (1000u / (fps ? fps : 20u))
+                                 ? (1000u / (fps ? fps : 10u))
                                  : 1000u;
 
             if (!s_stream_active)
@@ -924,17 +1117,26 @@ void camera_capture_individual_task(void *pvParameters)
         }
         else
         {
+            const uint32_t no_frame_ms =
+                pdTICKS_TO_MS(xTaskGetTickCount() - last_ok_tick);
             /* Chỉ log lần đầu và mỗi 10 lần để UART không bị ngập (log chậm
              * cũng có thể làm lệch nhịp các task khác). */
             if (read_fail == 0 || (read_fail % 10) == 9)
-                ESP_LOGE(TAG, "DMA error can not retrieve a frame from PSRAM Queue");
-            /* fb_get() trả NULL (driver/DMA treo) chứ không block: sau ~3 giây
-             * liên tiếp thất bại thì deinit + init lại ngay trong task này
-             * (task duy nhất chạm sensor nên an toàn), thay vì chạy vô ích. */
-            if (++read_fail >= 30)
+                ESP_LOGE(TAG, "DMA error can not retrieve a frame (%lu ms khong co frame)",
+                         (unsigned long)no_frame_ms);
+            read_fail++;
+
+            /* Camera "im lặng" quá lâu -> deinit + init lại ngay trong task này
+             * (task duy nhất chạm sensor nên an toàn). fb_get() chỉ timeout sau
+             * 4 s không có frame hợp lệ, nên ngưỡng 4 s = vừa đủ một lần chờ:
+             * khôi phục trong ~4-6 s thay vì 2 phút như trước (30 lần × 4 s).
+             * Đây là lưới an toàn cho mọi kiểu treo DMA/PLL mà driver không tự
+             * phục hồi được (NO-DATA, mất đồng bộ sau khi đổi cấu hình...). */
+            if (no_frame_ms >= 4000)
             {
                 read_fail = 0;
-                ESP_LOGW("CAM_TASK", "Mat frame 30 lan lien tiep - khoi tao lai camera");
+                ESP_LOGW("CAM_TASK", "Khong co frame %lu ms - khoi tao lai camera",
+                         (unsigned long)no_frame_ms);
                 video_capture_close(&cap);
                 shared_frame_len = 0;
                 while (!camera_init(&cap))
@@ -942,7 +1144,8 @@ void camera_capture_individual_task(void *pvParameters)
                     ESP_LOGE("CAM_TASK", "Khoi tao lai camera that bai - thu lai sau 5 giay");
                     vTaskDelay(pdMS_TO_TICKS(5000));
                 }
-                frame_tick = xTaskGetTickCount();
+                last_ok_tick = xTaskGetTickCount();
+                frame_tick = last_ok_tick;
                 continue;
             }
             vTaskDelay(pdMS_TO_TICKS(100));
@@ -967,7 +1170,8 @@ void camera_capture_individual_task(void *pvParameters)
 
             ESP_LOGI(TAG, "Capture %u frame/s, len %u, exp %d, gain %d, heap %u",
                      (unsigned)(s_stats.fps_x10 / 10), (unsigned)shared_frame_len,
-                     s_stats.exposure, s_stats.gain, (unsigned)s_stats.heap_free);            cnt = 0;
+                     s_stats.exposure, s_stats.gain, (unsigned)s_stats.heap_free);
+            cnt = 0;
         }
     }
 }

@@ -64,7 +64,11 @@ typedef struct {
     int wpc;             //  0 / 1  white pixel correction
     int lenc;            //  0 / 1  lens shading correction
     int raw_gma;         //  0 / 1  gamma RAW
-    int fps;             //  1 .. 30 tốc độ gửi frame
+    /* 1 .. 30: tốc độ GỬI frame, đồng thời là FPS tối thiểu của cảm biến.
+     * Firmware giới hạn AEC max exposure (0x3A02/0x3A03) theo giá trị này:
+     * fps thấp -> phơi sáng lâu -> sáng hơn nhưng nhoè; fps cao -> phơi ngắn,
+     * AGC bù bằng gain (trần ~64x). */
+    int fps;
 
     /* Kích thước khung hình tuỳ chỉnh (bỏ qua framesize khi custom = 1)
      *   width  : 96 .. 2048 (số chẵn)
@@ -94,10 +98,11 @@ bool camera_config_take_pending(cam_config_t *dst);
 typedef struct {
     uint32_t frames;      // tổng số frame đã capture từ lúc boot
     uint32_t invalid;     // số frame bị bỏ vì không có marker JPEG SOI (0xFFD8)
-    uint32_t fps_x10;     // fps capture đo trong 1 giây gần nhất, nhân 10
+    uint32_t fps_x10;     // fps capture đo trong cửa sổ 10 giây gần nhất, nhân 10
     uint32_t last_len;    // kích thước JPEG của frame gần nhất (byte)
-    int      exposure;    // 0x3501/0x3502 (đơn vị dòng)
-    int      gain;        // 0x3508/0x3509 (thô, 1x = 16)
+    int      exposure;    // 0x3500/0x3501/0x3502 (đơn vị dòng)
+    int      aec_max;     // trần phơi sáng 0x3A02/0x3A03 (dòng), suy ra từ fps
+    int      gain;        // 0x350A/0x350B (thô, 1x = 16)
     int      ae_manual;   // giá trị thanh ghi 0x3503
     int      out_w;       // chiều rộng khung đang áp dụng (sau khi kẹp tỉ lệ)
     int      out_h;       // chiều cao khung đang áp dụng

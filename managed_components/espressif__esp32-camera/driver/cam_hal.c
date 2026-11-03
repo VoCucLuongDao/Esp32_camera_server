@@ -64,6 +64,26 @@ static cam_obj_t *cam_obj = NULL;
 static volatile bool g_psram_dma_mode = CAMERA_PSRAM_DMA_ENABLED;
 static portMUX_TYPE g_psram_dma_lock = portMUX_INITIALIZER_UNLOCKED;
 
+/* ==================== CHẨN ĐOÁN ĐƯỜNG ỐNG FRAME ====================
+ * Đếm sự kiện để trả lời câu hỏi "frame rơi ở đâu?" khi log chỉ có
+ * "Failed to get frame: timeout":
+ *   vsync     – số xung VSYNC nhận được (cảm biến còn xuất hình?)
+ *   eof       – số lần DMA đầy nửa buffer (PCLK/DMA còn chạy?)
+ *   nodata    – VSYNC mà chưa có byte nào (DMA/I2S không nhận dữ liệu)
+ *   soi_fail  – frame bị bỏ vì thiếu SOI (bắt đầu giữa dòng)
+ *   soi_off   – có SOI nhưng không ở byte 0 (lệch đầu frame)
+ *   eoi_fail  – frame đủ SOI nhưng thiếu EOI (đứt cuối frame)
+ *   queued    – frame đã giao cho tầng trên
+ * In ra ở mỗi lần cam_take() timeout (4 s) nên vẫn thấy số liệu cả khi
+ * đường ống chết hoàn toàn. */
+static volatile uint32_t diag_vsync;
+static volatile uint32_t diag_eof;
+static volatile uint32_t diag_nodata;
+static volatile uint32_t diag_soi_fail;
+static volatile uint32_t diag_soi_off;
+static volatile uint32_t diag_eoi_fail;
+static volatile uint32_t diag_queued;
+
 /* At top of cam_hal.c – one switch for noisy ISR prints */
 #ifndef CAM_LOG_SPAM_EVERY_FRAME
 #define CAM_LOG_SPAM_EVERY_FRAME 0   /* set to 1 to restore old behaviour */
@@ -294,6 +314,7 @@ static void cam_task(void *arg)
                 size_t pixels_per_dma = (cam_obj->dma_half_buffer_size * cam_obj->fb_bytes_per_pixel) / (cam_obj->dma_bytes_per_item * cam_obj->in_bytes_per_pixel);
 
                 if (cam_event == CAM_IN_SUC_EOF_EVENT) {
+                    diag_eof++;
                     if(!cam_obj->psram_mode){
                         if (cam_obj->fb_size < (frame_buffer_event->len + pixels_per_dma)) {
                             ESP_CAMERA_ETS_PRINTF(DRAM_STR("cam_hal: FB-OVF\r\n"));
@@ -336,9 +357,11 @@ static void cam_task(void *arg)
                             if (soi_off != 0) {
                                 static uint16_t warn_psram_soi_cnt = 0;
                                 if (soi_off > 0) {
+                                    diag_soi_off++;
                                     CAM_WARN_THROTTLE(warn_psram_soi_cnt,
                                                       "NO-SOI - JPEG start marker not at pos 0 (PSRAM)");
                                 } else {
+                                    diag_soi_fail++;
                                     CAM_WARN_THROTTLE(warn_psram_soi_cnt,
                                                       "NO-SOI - JPEG start marker missing (PSRAM)");
                                 }
@@ -351,9 +374,11 @@ static void cam_task(void *arg)
                             if (soi_off != 0) {
                                 static uint16_t warn_soi_bad_cnt = 0;
                                 if (soi_off > 0) {
+                                    diag_soi_off++;
                                     CAM_WARN_THROTTLE(warn_soi_bad_cnt,
                                                       "NO-SOI - JPEG start marker not at pos 0");
                                 } else {
+                                    diag_soi_fail++;
                                     CAM_WARN_THROTTLE(warn_soi_bad_cnt,
                                                       "NO-SOI - JPEG start marker missing");
                                 }
@@ -368,7 +393,18 @@ static void cam_task(void *arg)
 
                 } else if (cam_event == CAM_VSYNC_EVENT) {
                     //DBG_PIN_SET(1);
+                    diag_vsync++;
                     ll_cam_stop(cam_obj);
+
+                    /* Không có byte nào từ VSYNC trước -> frame rỗng, driver huỷ
+                     * IM LẶNG. Đây chính là kiểu hỏng "không frame, không log":
+                     * cảm biến vẫn phát VSYNC nhưng PCLK/DMA không chạy. */
+                    if (!(cnt || !cam_obj->jpeg_mode || cam_obj->psram_mode)) {
+                        static uint16_t warn_nodata_cnt = 0;
+                        diag_nodata++;
+                        CAM_WARN_THROTTLE(warn_nodata_cnt,
+                                          "NO-DATA - VSYNC without DMA data (PCLK/I2S stalled)");
+                    }
 
                     if (cnt || !cam_obj->jpeg_mode || cam_obj->psram_mode) {
                         if (cam_obj->jpeg_mode) {
@@ -401,21 +437,27 @@ static void cam_task(void *arg)
                             }
                         }
                         //send frame
-                        if(!cam_obj->frames[frame_pos].en && xQueueSend(cam_obj->frame_buffer_queue, (void *)&frame_buffer_event, 0) != pdTRUE) {
-                            //pop frame buffer from the queue
-                            camera_fb_t * fb2 = NULL;
-                            if(xQueueReceive(cam_obj->frame_buffer_queue, &fb2, 0) == pdTRUE) {
-                                //push the new frame to the end of the queue
-                                if (xQueueSend(cam_obj->frame_buffer_queue, (void *)&frame_buffer_event, 0) != pdTRUE) {
-                                    cam_obj->frames[frame_pos].en = 1;
-                                    ESP_CAMERA_ETS_PRINTF(DRAM_STR("cam_hal: FBQ-SND\r\n"));
-                                }
-                                //free the popped buffer
-                                cam_give(fb2);
+                        if(!cam_obj->frames[frame_pos].en) {
+                            if (xQueueSend(cam_obj->frame_buffer_queue, (void *)&frame_buffer_event, 0) == pdTRUE) {
+                                diag_queued++;
                             } else {
-                                //queue is full and we could not pop a frame from it
-                                cam_obj->frames[frame_pos].en = 1;
-                                ESP_CAMERA_ETS_PRINTF(DRAM_STR("cam_hal: FBQ-RCV\r\n"));
+                                //pop frame buffer from the queue
+                                camera_fb_t * fb2 = NULL;
+                                if(xQueueReceive(cam_obj->frame_buffer_queue, &fb2, 0) == pdTRUE) {
+                                    //push the new frame to the end of the queue
+                                    if (xQueueSend(cam_obj->frame_buffer_queue, (void *)&frame_buffer_event, 0) != pdTRUE) {
+                                        cam_obj->frames[frame_pos].en = 1;
+                                        ESP_CAMERA_ETS_PRINTF(DRAM_STR("cam_hal: FBQ-SND\r\n"));
+                                    } else {
+                                        diag_queued++;
+                                    }
+                                    //free the popped buffer
+                                    cam_give(fb2);
+                                } else {
+                                    //queue is full and we could not pop a frame from it
+                                    cam_obj->frames[frame_pos].en = 1;
+                                    ESP_CAMERA_ETS_PRINTF(DRAM_STR("cam_hal: FBQ-RCV\r\n"));
+                                }
                             }
                         }
                     }
@@ -705,7 +747,11 @@ camera_fb_t *cam_take(TickType_t timeout)
     {
         TickType_t elapsed = xTaskGetTickCount() - start; /* TickType_t is unsigned so rollover is safe */
         if (elapsed >= timeout) {
-            ESP_LOGW(TAG, "Failed to get frame: timeout");
+            ESP_LOGW(TAG, "Failed to get frame: timeout (vsync=%u eof=%u queued=%u "
+                          "nodata=%u soi_fail=%u soi_off=%u eoi_fail=%u)",
+                     (unsigned)diag_vsync, (unsigned)diag_eof, (unsigned)diag_queued,
+                     (unsigned)diag_nodata, (unsigned)diag_soi_fail,
+                     (unsigned)diag_soi_off, (unsigned)diag_eoi_fail);
             return NULL;
         }
         TickType_t remaining = timeout - elapsed;
@@ -770,6 +816,7 @@ camera_fb_t *cam_take(TickType_t timeout)
 
 skip_eoi_check:
 
+            diag_eoi_fail++;
             CAM_WARN_THROTTLE(warn_eoi_miss_cnt,
                               "NO-EOI - JPEG end marker missing");
             cam_give(dma_buffer);

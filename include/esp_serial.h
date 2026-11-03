@@ -8,8 +8,8 @@
 #include "esp_system.h"
 #include "esp_event.h"
 #include "esp_log.h"
-#include "driver/uart.h" // Thêm thư viện điều khiển UART
-#include "esp_vfs_dev.h" // Thêm thư viện này để map stdout sang UART
+#include "driver/uart.h"      // Thêm thư viện điều khiển UART
+#include "driver/uart_vfs.h"  // Map stdout/stdin sang UART (API mới, không deprecated)
 
 #define UART_TX_NUM        1
 #define UART_RX_NUM        3

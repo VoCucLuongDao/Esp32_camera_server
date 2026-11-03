@@ -20,8 +20,9 @@ void init_serial_debug(void)
     // Gán chính xác chân TX=1 và RX=3 cho bộ UART_NUM_0 qua bộ IO MUX phần cứng
     ESP_ERROR_CHECK(uart_set_pin(UART_NUM_0, UART_TX_NUM, UART_RX_NUM, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
 
-    esp_vfs_dev_uart_register();
-    esp_vfs_dev_uart_use_driver(UART_NUM_0);
-    esp_log_level_set("*", ESP_LOG_INFO); 
+    uart_vfs_dev_register();
+    uart_vfs_dev_use_driver(UART_NUM_0);
+    esp_log_level_set("*", ESP_LOG_INFO);
 
+    ESP_LOGI(TAG, "UART0 debug san sang (115200, TX=%d, RX=%d)", UART_TX_NUM, UART_RX_NUM);
 }

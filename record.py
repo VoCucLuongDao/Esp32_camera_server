@@ -1,12 +1,12 @@
 """
-ESP32-CAM client + bảng điều khiển (Tkinter).
+ESP32-CAM client and control panel (Tkinter).
 
-Kiến trúc 2 kênh TCP:
-  - Cổng 1357 : ESP32 -> PC, truyền frame nhị phân [uint32 len][JPEG]
-  - Cổng 1358 : PC -> ESP32, gửi lệnh text "CFG key=value ..." và nhận OK/ERR
+Two-channel TCP architecture:
+  - Port 1357: ESP32 -> PC, binary frames [uint32 len][JPEG]
+  - Port 1358: PC -> ESP32, sends "CFG key=value ..." commands and receives OK/ERR
 
-Chạy:  python record.py
-Thoát: nhấn 'q' ở cửa sổ video hoặc đóng cửa sổ điều khiển.
+Run:  python record.py
+Exit: press 'q' in the video window or close the control panel.
 """
 
 import os
@@ -30,7 +30,10 @@ CONTROL_PORT = 1358           # điều khiển thông số
 UDP_BROADCAST_PORT = 5005     # khám phá server
 AUTH_PASSWORD = "pass187631"
 
-MAX_FRAME_SIZE = 1024 * 1024  # 1 MB, khớp với kiểm tra phía ESP32
+# Trần kích thước 1 frame hợp lệ. Firmware cấp buffer JPEG ~629 KB/frame
+# (OV3660_JPEG_BUF_MAX) nên frame thật không vượt ngưỡng này; giá trị lớn hơn
+# chỉ để chặn header hỏng/gói rác làm client cấp phát vô hạn.
+MAX_FRAME_SIZE = 1024 * 1024
 VIDEO_WINDOW = "ESP32-CAM Stream"
 
 # ---- Ghi video MP4 ----
@@ -55,43 +58,26 @@ FRAME_SIZES = [
     ("1600x1200 UXGA", 15), ("1920x1080 FHD", 16),
 ]
 
-WB_MODES = [("Auto", 0), ("Nắng", 1), ("Mây", 2), ("Văn phòng", 3), ("Đèn sợi đốt", 4)]
-EFFECTS = [("Không", 0), ("Âm bản", 1), ("Trắng đen", 2), ("Ánh đỏ", 3),
-           ("Ánh xanh lá", 4), ("Ánh xanh dương", 5), ("Sepia", 6)]
+WB_MODES = [("Auto", 0), ("Sunny", 1), ("Cloudy", 2), ("Office", 3), ("Incandescent", 4)]
+EFFECTS = [("None", 0), ("Negative", 1), ("Grayscale", 2), ("Red tint", 3),
+           ("Green tint", 4), ("Blue tint", 5), ("Sepia", 6)]
 
 # name, nhãn hiển thị, min, max, mặc định
-# Mặc định = bộ "thiếu sáng" (khớp camera_config_defaults() trong firmware).
+# Mặc định ưu tiên giảm nhiễu trong ánh sáng bình thường; các giá trị phải
+# khớp camera_config_defaults() trong firmware.
 SLIDERS = [
-    ("brightness", "Độ sáng", -2, 2, 1),
-    ("contrast", "Tương phản", -2, 2, 1),
-    ("saturation", "Độ bão hoà", -2, 2, 1),
-    ("sharpness", "Độ nét", -2, 2, 2),
-    ("denoise", "Khử nhiễu (0-8)", 0, 8, 3),
-    ("ae_level", "Bù sáng AE", -2, 2, 2),
-    ("gainceiling", "Trần gain (0-6)", 0, 6, 5),
-    ("quality", "Chất lượng JPEG (0 nét nhất)", 0, 63, 6),
-    ("aec_value", "Phơi sáng thủ công", 0, 1200, 400),
-    ("agc_gain", "Gain thủ công", 0, 30, 0),
-    ("fps", "FPS gửi frame", 1, 30, 10),
+    ("brightness", "Brightness", -2, 2, 0),
+    ("contrast", "Contrast", -2, 2, 0),
+    ("saturation", "Saturation", -2, 2, 1),
+    ("sharpness", "Sharpness", -2, 2, 0),
+    ("denoise", "Denoise (0-8)", 0, 8, 5),
+    ("ae_level", "AE compensation", -2, 2, 0),
+    ("gainceiling", "Gain ceiling (0-6)", 0, 6, 0),
+    ("quality", "JPEG quality (0 = best)", 0, 63, 12),
+    ("aec_value", "Manual exposure", 0, 1200, 400),
+    ("agc_gain", "Manual gain", 0, 30, 0),
+    ("fps", "FPS (stream + max exposure)", 1, 30, 5),
 ]
-
-# Bộ thông số nhanh cho các điều kiện ánh sáng thường gặp. Chỉ gồm các thanh
-# trượt; độ phân giải / lật ảnh / white balance giữ nguyên như người dùng đặt.
-LOW_LIGHT_PRESET = {
-    "brightness": 1, "contrast": 1, "saturation": 1, "sharpness": 2,
-    "denoise": 3, "ae_level": 2, "gainceiling": 5, "fps": 10,
-}
-# Ưu tiên chi tiết khuôn mặt: ít khử nhiễu + làm nét tối đa + gain cao nhất.
-# Đổi lại ảnh sẽ hạt hơn; nếu mặt vẫn nhoè thì nguyên nhân là phơi sáng dài
-# (người di chuyển) hoặc mất nét ống kính, không phải tham số ISP.
-FACE_PRESET = {
-    "brightness": 1, "contrast": 1, "saturation": 1, "sharpness": 2,
-    "denoise": 1, "ae_level": 2, "gainceiling": 5, "fps": 10,
-}
-DAYLIGHT_PRESET = {
-    "brightness": 0, "contrast": 1, "saturation": 1, "sharpness": 1,
-    "denoise": 2, "ae_level": 0, "gainceiling": 2, "fps": 15,
-}
 
 DEFAULTS = {name: default for name, _, _, _, default in SLIDERS}
 DEFAULTS.update({
@@ -101,6 +87,43 @@ DEFAULTS.update({
     # kích thước khung hình tuỳ chỉnh (bỏ qua framesize khi custom = 1)
     "custom": 0, "width": 1024, "height": 768,
 })
+
+# Mỗi mode đặt lại toàn bộ thông số ảnh dùng chung để không sót giá trị từ mode
+# trước hoặc từ thao tác tay. Độ phân giải, lật, WB và hiệu ứng vẫn giữ theo lựa
+# chọn của người dùng.
+MODE_BASE_PRESET = {
+    **{name: DEFAULTS[name] for name, *_ in SLIDERS},
+    **{name: DEFAULTS[name] for name in
+       ("aec", "agc", "bpc", "wpc", "lenc", "raw_gma")},
+}
+
+# Dùng trong cảnh tối; gain cao hơn mode ban ngày nên ảnh có thể nhiễu hơn.
+LOW_LIGHT_PRESET = {
+    **MODE_BASE_PRESET,
+    "brightness": 1, "contrast": 1, "sharpness": 2,
+    "denoise": 4, "ae_level": 2, "gainceiling": 2,
+    "aec": 1, "agc": 1,
+}
+# Ưu tiên chi tiết mặt/chuyển động; gain cao và ít khử nhiễu nên ảnh hạt hơn.
+FACE_PRESET = {
+    **MODE_BASE_PRESET,
+    "brightness": 1, "contrast": 1, "sharpness": 2,
+    "denoise": 1, "ae_level": 2, "gainceiling": 5,
+    "aec": 1, "agc": 1,
+}
+DAYLIGHT_PRESET = {
+    **MODE_BASE_PRESET,
+    # XGA ở PCLK 10 MHz đạt tối đa ~5,5 fps; đặt cao hơn không nhanh thêm.
+    "aec": 1, "agc": 1,
+}
+# Lắp trong tường, nhìn qua khe ngang: crop 16:9 và giảm bitrate để Wi-Fi yếu
+# vẫn truyền được. Gain 4x giữ sáng vừa phải mà không đẩy nhiễu quá cao.
+WALL_SLIT_PRESET = {
+    **MODE_BASE_PRESET,
+    "custom": 1, "width": 640, "height": 360,
+    "quality": 20, "denoise": 4, "gainceiling": 1, "fps": 5,
+    "aec": 1, "agc": 1,
+}
 
 # Giới hạn kích thước tuỳ chỉnh = vùng cảm biến OV3660 (phải khớp firmware)
 CUSTOM_W_MIN, CUSTOM_W_MAX = 96, 2048
@@ -241,7 +264,7 @@ class CameraLink:
                     except socket.timeout:
                         continue
                     except OSError as exc:
-                        self._status(f"UDP discovery lỗi: {exc}")
+                        self._status(f"UDP discovery error: {exc}")
                         time.sleep(1.0)
                         break
                     if data.decode("utf-8", errors="ignore") == "DISCOVER_SERVER":
@@ -249,10 +272,10 @@ class CameraLink:
                             sock.sendto(f"KEY-IP {local_ip}".encode(), addr)
                         except OSError:
                             continue
-                        self._status(f"ESP32 {addr[0]} hỏi IP, đã trả lời {local_ip}")
+                        self._status(f"ESP32 {addr[0]} requested IP; replied with {local_ip}")
             except OSError as exc:
-                self._status(f"Không mở được cổng UDP {UDP_BROADCAST_PORT}: {exc} "
-                             f"— thử lại sau 5 s")
+                self._status(f"Cannot open UDP port {UDP_BROADCAST_PORT}: {exc} "
+                             f"— retrying in 5 s")
                 time.sleep(5.0)
             finally:
                 if sock is not None:
@@ -270,10 +293,10 @@ class CameraLink:
                 srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 srv.bind((SERVER_IP, SERVER_PORT))
                 srv.listen(1)
-                self._status(f"Đang chờ video trên cổng {SERVER_PORT}...")
+                self._status(f"Waiting for video on port {SERVER_PORT}...")
             except OSError as exc:
-                self._status(f"Không mở được cổng video {SERVER_PORT}: {exc} "
-                             f"(có chương trình khác đang dùng?) — thử lại sau 5 s")
+                self._status(f"Cannot open video port {SERVER_PORT}: {exc} "
+                             f"(is another program using it?) — retrying in 5 s")
                 if srv is not None:
                     srv.close()
                 time.sleep(5.0)
@@ -283,7 +306,7 @@ class CameraLink:
                 try:
                     conn, addr = srv.accept()
                 except OSError as exc:
-                    self._status(f"Lỗi chờ video: {exc}")
+                    self._status(f"Video accept error: {exc}")
                     break
                 threading.Thread(target=self._video_session, args=(conn, addr),
                                  daemon=True).start()
@@ -293,6 +316,17 @@ class CameraLink:
 
     def _video_session(self, conn, addr):
         try:
+            # Tối ưu socket nhận cho WiFi yếu:
+            #  - TCP_NODELAY: ESP32 đẩy frame ngay, không chờ gom gói.
+            #  - SO_KEEPALIVE: phát hiện peer chết.
+            #  - SO_RCVBUF lớn: đủ chỗ đệm 1 frame JPEG vài trăm KB khi link chậm.
+            try:
+                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 512 * 1024)
+            except OSError:
+                pass
+
             # Nếu ESP32 mất điện giữa khung hình, recv sẽ treo vô hạn nếu không
             # có timeout -> đặt timeout để tự ngắt và chờ kết nối lại.
             conn.settimeout(VIDEO_STALL_TIMEOUT)
@@ -309,11 +343,11 @@ class CameraLink:
                     break
 
             if b"AUTH_OK" not in auth:
-                self._status(f"Xác thực thất bại: {auth!r}")
+                self._status(f"Authentication failed: {auth!r}")
                 return
 
             self.video_connected = True
-            self._status(f"Video đã kết nối từ {addr[0]}")
+            self._status(f"Video connected from {addr[0]}")
 
             while True:
                 header = self._recv_exact(conn, 4)
@@ -321,7 +355,7 @@ class CameraLink:
                     break
                 size = struct.unpack("<I", header)[0]
                 if size == 0 or size > MAX_FRAME_SIZE:
-                    self._status(f"Kích thước frame không hợp lệ ({size}), ngắt kết nối")
+                    self._status(f"Invalid frame size ({size}); disconnecting")
                     break
                 payload = self._recv_exact(conn, size)
                 if payload is None:
@@ -337,19 +371,19 @@ class CameraLink:
                     except (queue.Empty, queue.Full):
                         pass
         except socket.timeout:
-            self._status(f"Video quá {VIDEO_STALL_TIMEOUT:.0f} s không có dữ liệu — "
-                         f"ngắt để ESP32 kết nối lại")
+            self._status(f"No video data for {VIDEO_STALL_TIMEOUT:.0f} s — "
+                         f"disconnecting so ESP32 can reconnect")
         except OSError as exc:
-            self._status(f"Video session lỗi: {exc}")
+            self._status(f"Video session error: {exc}")
         except Exception as exc:        # lỗi lạ không được làm chết tiến trình
-            self._status(f"Video session lỗi không xác định: {exc}")
+            self._status(f"Unknown video session error: {exc}")
         finally:
             self.video_connected = False
             try:
                 conn.close()
             except OSError:
                 pass
-            self._status("Video đã ngắt, chờ ESP32 kết nối lại...")
+            self._status("Video disconnected; waiting for ESP32 to reconnect...")
 
     # -- 3. TCP control --
     def _ctrl_server(self):
@@ -361,8 +395,8 @@ class CameraLink:
                 srv.bind((SERVER_IP, CONTROL_PORT))
                 srv.listen(1)
             except OSError as exc:
-                self._status(f"Không mở được cổng điều khiển {CONTROL_PORT}: {exc} "
-                             f"(có chương trình khác đang dùng?) — thử lại sau 5 s")
+                self._status(f"Cannot open control port {CONTROL_PORT}: {exc} "
+                             f"(is another program using it?) — retrying in 5 s")
                 if srv is not None:
                     srv.close()
                 time.sleep(5.0)
@@ -372,7 +406,7 @@ class CameraLink:
                 try:
                     conn, addr = srv.accept()
                 except OSError as exc:
-                    self._status(f"Lỗi chờ kênh điều khiển: {exc}")
+                    self._status(f"Control connection accept error: {exc}")
                     break
                 threading.Thread(target=self._ctrl_session, args=(conn, addr),
                                  daemon=True).start()
@@ -386,7 +420,7 @@ class CameraLink:
         self.ctrl_connected = True
         self.last_ctrl_rx = time.time()
         self.need_sync = True     # ESP32 vừa (kết nối lại) -> đồng bộ toàn bộ tham số
-        self._status(f"Kênh điều khiển đã kết nối từ {addr[0]}:{CONTROL_PORT}")
+        self._status(f"Control channel connected from {addr[0]}:{CONTROL_PORT}")
 
         # Không đặt timeout cứng: kênh này im lặng khi không ai chỉnh gì. Việc
         # phát hiện "đã chết" do watchdog PING ở vòng UI đảm nhiệm.
@@ -411,7 +445,7 @@ class CameraLink:
                             except Exception:
                                 pass
         except OSError as exc:
-            self._status(f"Kênh điều khiển lỗi: {exc}")
+            self._status(f"Control channel error: {exc}")
         finally:
             with self.ctrl_lock:
                 if self.ctrl_sock is conn:
@@ -421,7 +455,7 @@ class CameraLink:
                 conn.close()
             except OSError:
                 pass
-            self._status("Kênh điều khiển đã đóng")
+            self._status("Control channel closed")
 
     # -- API cho UI --
     @staticmethod
@@ -445,7 +479,7 @@ class CameraLink:
             return False
         line = "CFG " + " ".join(f"{k}={v}" for k, v in safe.items()) + "\n"
         if len(line) > CTRL_LINE_MAX:
-            self._status("Cấu hình quá dài, không gửi (lỗi nội bộ)")
+            self._status("Configuration is too long; not sent (internal error)")
             return False
 
         with self.ctrl_lock:
@@ -456,7 +490,7 @@ class CameraLink:
                 self.last_ctrl_rx = time.time()
                 return True
             except OSError as exc:
-                self._status(f"Gửi lệnh thất bại: {exc}")
+                self._status(f"Command send failed: {exc}")
                 return False
 
     def send_raw(self, text):
@@ -468,7 +502,7 @@ class CameraLink:
                 self.last_ctrl_rx = time.time()
                 return True
             except OSError as exc:
-                self._status(f"Gửi lệnh thất bại: {exc}")
+                self._status(f"Command send failed: {exc}")
                 return False
 
     def ctrl_watchdog(self):
@@ -478,7 +512,7 @@ class CameraLink:
             return
         idle = self.ctrl_idle_seconds()
         if idle >= CTRL_DEAD_AFTER:
-            self._status("Kênh điều khiển không phản hồi — đóng để ESP32 nối lại")
+            self._status("Control channel is unresponsive — closing it so ESP32 can reconnect")
             self.ctrl_abort()
         elif idle >= CTRL_IDLE_PING and time.time() - self._ping_sent >= CTRL_IDLE_PING:
             self._ping_sent = time.time()
@@ -508,6 +542,7 @@ class ControlPanel:
         self._last_send = 0.0     # time.monotonic() của lần gửi CFG gần nhất
         self._building = True     # đang dựng UI: chưa gửi gì
         self._closing = False
+        self._video_window_open = False
 
         # trạng thái ghi video
         self.record_writer = None
@@ -522,9 +557,10 @@ class ControlPanel:
         self.record_seg_limit = 0     # số frame tối đa mỗi đoạn
         self.record_base = ""         # tên gốc dùng chung cho mọi đoạn
 
-        self.status_var = tk.StringVar(value="Khởi động...")
+        self.status_var = tk.StringVar(value="Starting...")
 
         self._build_ui()
+        self._waiting_frame = np.zeros((360, 640, 3), dtype=np.uint8)
         self._building = False    # từ đây mọi thay đổi mới được gửi đi
         self.link.status_cb = self._set_status_async
         self.link.on_ctrl_line = self.log_queue.put
@@ -533,7 +569,7 @@ class ControlPanel:
 
     # ---------- dựng giao diện ----------
     def _build_ui(self):
-        self.root.title("ESP32-CAM — Bảng điều khiển OV3660")
+        self.root.title("ESP32-CAM — OV3660 Control Panel")
         self.root.geometry("1180x760")
 
         main = ttk.Frame(self.root, padding=8)
@@ -543,18 +579,23 @@ class ControlPanel:
         left = ttk.Frame(main)
         left.pack(side="left", fill="both", expand=True)
 
-        box = ttk.LabelFrame(left, text="Video (cửa sổ OpenCV)", padding=8)
+        box = ttk.LabelFrame(left, text="Video (OpenCV window)", padding=8)
         box.pack(fill="both", expand=True)
         self.info = tk.Text(box, height=12, width=44, state="disabled",
                             font=("Consolas", 9))
         self.info.pack(fill="both", expand=True)
-        ttk.Label(left, text="Nhấn 'q' ở cửa sổ video để thoát.",
+        ttk.Label(left, text="Press 'q' in the video window to exit.",
                   foreground="#555").pack(anchor="w", pady=(6, 0))
 
         # ---- bên phải: bảng điều khiển ----
         right = ttk.Frame(main, width=460)
         right.pack(side="right", fill="y", padx=(10, 0))
         right.pack_propagate(False)
+
+        ttk.Label(right, text="Status:").pack(anchor="w", pady=(0, 2))
+        ttk.Label(right, textvariable=self.status_var, wraplength=410,
+                  foreground="#0a5").pack(anchor="w", pady=(0, 6))
+        ttk.Separator(right).pack(fill="x", pady=(0, 6))
 
         notebook = ttk.Notebook(right)
         notebook.pack(fill="both", expand=True)
@@ -568,42 +609,42 @@ class ControlPanel:
 
         # Mọi thay đổi được gửi tự động (~150 ms) nên nút này chỉ là "gửi lại
         # toàn bộ" khi cần (ví dụ sau khi ESP32 vừa khởi động lại).
-        ttk.Button(buttons, text="Gửi lại", command=self.apply).pack(side="left")
-        ttk.Button(buttons, text="Mặc định", command=self.reset_defaults).pack(side="left", padx=4)
-        ttk.Button(buttons, text="Đọc trạng thái", command=self.read_stats).pack(side="left", padx=4)
-        self.record_btn = ttk.Button(buttons, text="● Ghi MP4",
+        ttk.Button(buttons, text="Show video",
+                   command=self._open_video_window).pack(side="left")
+        ttk.Button(buttons, text="Send", command=self.apply).pack(side="left")
+        ttk.Button(buttons, text="Defaults", command=self.reset_defaults).pack(side="left", padx=4)
+        ttk.Button(buttons, text="Read status", command=self.read_stats).pack(side="left", padx=4)
+        self.record_btn = ttk.Button(buttons, text="● Record MP4",
                                      command=self.toggle_record)
         self.record_btn.pack(side="left", padx=(4, 0))
 
-        ttk.Label(right, text="Thay đổi được gửi tự động — không cần bấm nút "
-                              "(tối đa 1 lần/giây).",
+        ttk.Label(right, text="Changes are sent automatically — no button needed "
+                              "(up to once per second).",
                   foreground="#666", wraplength=410).pack(anchor="w", pady=(0, 2))
 
-        ttk.Button(right, text="Khởi động lại ESP32",
+        ttk.Button(right, text="Restart ESP32",
                    command=self.restart_esp).pack(fill="x", pady=(2, 4))
-
-        ttk.Separator(right).pack(fill="x", pady=6)
-        ttk.Label(right, text="Trạng thái:").pack(anchor="w")
-        ttk.Label(right, textvariable=self.status_var, wraplength=410,
-                  foreground="#0a5").pack(anchor="w", pady=(2, 0))
 
     def _build_image_tab(self, notebook):
         tab = ttk.Frame(notebook, padding=8)
-        notebook.add(tab, text="Hình ảnh")
+        notebook.add(tab, text="Image")
 
-        # Bộ thông số nhanh: đổi cả nhóm thanh trượt bằng 1 cú bấm
+        # Quick presets: change the full group of settings with one click.
         row = ttk.Frame(tab)
         row.pack(fill="x", pady=(0, 6))
-        ttk.Label(row, text="Chế độ", width=10).pack(side="left")
-        ttk.Button(row, text="Thiếu sáng",
+        ttk.Label(row, text="Mode", width=10).pack(side="left")
+        ttk.Button(row, text="Low light",
                    command=lambda: self.apply_preset(LOW_LIGHT_PRESET,
-                                                    "thiếu sáng")).pack(side="left")
-        ttk.Button(row, text="Rõ mặt",
+                                                    "Low light")).pack(side="left")
+        ttk.Button(row, text="Face detail",
                    command=lambda: self.apply_preset(FACE_PRESET,
-                                                    "rõ mặt")).pack(side="left", padx=4)
-        ttk.Button(row, text="Ban ngày",
+                                                    "Face detail")).pack(side="left", padx=4)
+        ttk.Button(row, text="Daylight",
                    command=lambda: self.apply_preset(DAYLIGHT_PRESET,
-                                                    "ban ngày")).pack(side="left")
+                                                    "Daylight")).pack(side="left")
+        ttk.Button(row, text="Advanced",
+                   command=lambda: self.apply_preset(WALL_SLIT_PRESET,
+                                                    "Wall / horizontal slot")).pack(side="left", padx=4)
 
         for name, label, lo, hi, default in SLIDERS:
             row = ttk.Frame(tab)
@@ -630,10 +671,10 @@ class ControlPanel:
             scale.bind("<KeyRelease>", lambda _e: self._schedule_send())
             self.scales[name] = scale
 
-        # độ phân giải chuẩn
+        # Standard resolution.
         row = ttk.Frame(tab)
         row.pack(fill="x", pady=(10, 2))
-        ttk.Label(row, text="Độ phân giải", width=27).pack(side="left")
+        ttk.Label(row, text="Resolution", width=27).pack(side="left")
         self.combos["framesize"] = ttk.Combobox(
             row, state="readonly", width=20,
             values=[f"{n}  (#{i})" for n, i in FRAME_SIZES])
@@ -641,17 +682,17 @@ class ControlPanel:
         self.combos["framesize"].pack(side="left")
         self.combos["framesize"].bind("<<ComboboxSelected>>", lambda _e: self._schedule_send())
 
-        # kích thước tuỳ chỉnh: bật -> bỏ qua ô "Độ phân giải" ở trên
+        # Custom size: when enabled, the Resolution field above is ignored.
         row = ttk.Frame(tab)
         row.pack(fill="x", pady=(8, 2))
         self.custom_var = tk.IntVar(value=DEFAULTS["custom"])
-        ttk.Checkbutton(row, text="Kích thước tuỳ chỉnh (W × H)",
+        ttk.Checkbutton(row, text="Custom size (W × H)",
                         variable=self.custom_var,
                         command=self._on_custom_toggle).pack(side="left")
 
         row = ttk.Frame(tab)
         row.pack(fill="x", pady=2)
-        ttk.Label(row, text="Rộng × Cao", width=27).pack(side="left")
+        ttk.Label(row, text="Width × Height", width=27).pack(side="left")
         self.width_var = tk.IntVar(value=DEFAULTS["width"])
         self.height_var = tk.IntVar(value=DEFAULTS["height"])
         self.width_spin = ttk.Spinbox(row, from_=CUSTOM_W_MIN, to=CUSTOM_W_MAX,
@@ -665,7 +706,7 @@ class ControlPanel:
                                        textvariable=self.height_var,
                                        command=self._schedule_send)
         self.height_spin.pack(side="left")
-        ttk.Label(row, text="  pixel", foreground="#666").pack(side="left")
+        ttk.Label(row, text="  pixels", foreground="#666").pack(side="left")
 
         # gõ tay số rồi Enter / rời ô cũng gửi đi
         for spin in (self.width_spin, self.height_spin):
@@ -673,18 +714,17 @@ class ControlPanel:
             spin.bind("<FocusOut>", lambda _e: self._schedule_send())
 
         ttk.Label(tab, justify="left", wraplength=390, foreground="#666",
-                  text="Số chẵn, tối đa 2048 × 1536 (vùng cảm biến OV3660). "
-                       "Mọi kích thước đều thu nhỏ TOÀN KHUNG cảm biến (giữ "
-                       "góc nhìn rộng); cửa sổ được canh giữa nên ảnh luôn lấy "
-                       "từ trung tâm, không lệch góc. Kích thước thật xem ở ô "
-                       "log (STAT res=...).").pack(anchor="w", pady=(2, 0))
+                  text="Dimensions must be even, up to 2048 × 1536 (OV3660 sensor "
+                       "area). The full sensor frame is scaled to preserve the "
+                       "wide field of view; the window is centered. Check the "
+                       "log (STAT res=...) for the actual size.").pack(anchor="w", pady=(2, 0))
 
         self._update_res_state()
 
-        # bộ lọc phía client
+        # Client-side display filter.
         row = ttk.Frame(tab)
         row.pack(fill="x", pady=2)
-        ttk.Label(row, text="Bộ lọc hiển thị (PC)", width=27).pack(side="left")
+        ttk.Label(row, text="Display filter (PC)", width=27).pack(side="left")
         self.filter_combo = ttk.Combobox(row, state="readonly", width=20,
                                          values=FILTER_MODES)
         self.filter_combo.set(self.filter_mode)
@@ -694,17 +734,17 @@ class ControlPanel:
 
     def _build_sensor_tab(self, notebook):
         tab = ttk.Frame(notebook, padding=8)
-        notebook.add(tab, text="Cảm biến OV3660")
+        notebook.add(tab, text="OV3660 sensor")
 
-        # lật / gương
-        for name, label in (("hmirror", "Lật ngang (mirror 0x3821)"),
-                            ("vflip", "Lật dọc (flip 0x3820)")):
+        # Flip / mirror.
+        for name, label in (("hmirror", "Horizontal mirror (0x3821)"),
+                            ("vflip", "Vertical flip (0x3820)")):
             var = tk.IntVar(value=DEFAULTS[name])
             self.checks[name] = var
             ttk.Checkbutton(tab, text=label, variable=var,
                             command=self._schedule_send).pack(anchor="w", pady=2)
 
-        # auto exposure / gain
+        # Auto exposure / gain.
         ttk.Separator(tab).pack(fill="x", pady=6)
         self.checks["aec"] = tk.IntVar(value=DEFAULTS["aec"])
         ttk.Checkbutton(tab, text="Auto Exposure (AEC)", variable=self.checks["aec"],
@@ -713,22 +753,22 @@ class ControlPanel:
         ttk.Checkbutton(tab, text="Auto Gain (AGC)", variable=self.checks["agc"],
                         command=self._schedule_send).pack(anchor="w", pady=2)
 
-        # hiệu chỉnh điểm ảnh
+        # Pixel correction.
         ttk.Separator(tab).pack(fill="x", pady=6)
-        for name, label in (("bpc", "BPC — sửa điểm đen"),
-                            ("wpc", "WPC — sửa điểm trắng"),
-                            ("lenc", "LENC — bù sáng viền ống kính"),
+        for name, label in (("bpc", "BPC — black pixel correction"),
+                            ("wpc", "WPC — white pixel correction"),
+                            ("lenc", "LENC — lens shading correction"),
                             ("raw_gma", "Gamma RAW")):
             var = tk.IntVar(value=DEFAULTS[name])
             self.checks[name] = var
             ttk.Checkbutton(tab, text=label, variable=var,
                             command=self._schedule_send).pack(anchor="w", pady=2)
 
-        # white balance + hiệu ứng
+        # White balance + effects.
         ttk.Separator(tab).pack(fill="x", pady=6)
         row = ttk.Frame(tab)
         row.pack(fill="x", pady=2)
-        ttk.Label(row, text="Cân bằng trắng", width=18).pack(side="left")
+        ttk.Label(row, text="White balance", width=18).pack(side="left")
         self.combos["wb_mode"] = ttk.Combobox(row, state="readonly", width=18,
                                               values=[f"{n}" for n, _ in WB_MODES])
         self.combos["wb_mode"].current(0)
@@ -737,7 +777,7 @@ class ControlPanel:
 
         row = ttk.Frame(tab)
         row.pack(fill="x", pady=2)
-        ttk.Label(row, text="Hiệu ứng màu", width=18).pack(side="left")
+        ttk.Label(row, text="Color effect", width=18).pack(side="left")
         self.combos["effect"] = ttk.Combobox(row, state="readonly", width=18,
                                              values=[f"{n}" for n, _ in EFFECTS])
         self.combos["effect"].current(0)
@@ -750,10 +790,10 @@ class ControlPanel:
             var.trace_add("write", lambda *_a: self._schedule_send())
 
         ttk.Label(tab, justify="left", wraplength=390, foreground="#666",
-                  text="Lưu ý: các tham số này ghi trực tiếp vào thanh ghi OV3660 "
-                       "(0x3503, 0x3501/02, 0x3508/09, 0x3820/21, 0x4407...). "
-                       "Thay đổi được áp dụng ở task capture nên video có thể "
-                       "giật 1-2 frame.").pack(anchor="w", pady=(12, 0))
+                  text="Note: These settings write directly to OV3660 registers "
+                       "(0x3503, 0x3500/01/02, 0x350A/0B, 0x3820/21, 0x4407...). "
+                       "Changes are applied by the capture task, so the video "
+                       "may skip 1–2 frames.").pack(anchor="w", pady=(12, 0))
 
     # ---------- thu thập / gửi tham số ----------
     @staticmethod
@@ -835,25 +875,45 @@ class ControlPanel:
         try:
             params = self._collect()
         except Exception as exc:        # ô nhập rác không được làm sập UI
-            self._set_status(f"Giá trị không hợp lệ: {exc}")
+            self._set_status(f"Invalid value: {exc}")
             return
         if not self.link.send_params(params):
-            self._set_status("Chưa kết nối kênh điều khiển — không gửi được tham số")
+            self._set_status("Control channel is not connected — parameters were not sent")
             return
-        self._set_status("Đã gửi cấu hình: " +
+        self._set_status("Configuration sent: " +
                          " ".join(f"{k}={v}" for k, v in list(params.items())[:4]) + " ...")
 
     def apply_preset(self, preset, name):
-        """Áp nhanh một nhóm thông số ánh sáng rồi gửi xuống ESP32."""
+        """Áp nhanh một nhóm thông số (ánh sáng hoặc băng thông) rồi gửi xuống ESP32."""
         for key, value in preset.items():
-            var = self.vars.get(key)
-            if var is None:
+            if key == "framesize":
+                for idx, (_, fs) in enumerate(FRAME_SIZES):
+                    if fs == value:
+                        self.combos["framesize"].current(idx)
+                        break
+                # độ phân giải chuẩn có hiệu lực -> tắt kích thước tuỳ chỉnh
+                self.custom_var.set(0)
+                self._update_res_state()
                 continue
-            var.set(value)
-            self.scales[key].set(value)
-            self.value_labels[key].config(text=str(value))
+            if key == "custom":
+                self.custom_var.set(value)
+                self._update_res_state()
+                continue
+            if key in ("width", "height"):
+                var = self.width_var if key == "width" else self.height_var
+                var.set(value)
+                continue
+            var = self.vars.get(key)
+            if var is not None:
+                var.set(value)
+                self.scales[key].set(value)
+                self.value_labels[key].config(text=str(value))
+                continue
+            check = self.checks.get(key)
+            if check is not None:
+                check.set(value)
         self._schedule_send()
-        self._set_status(f"Đã chọn chế độ {name}: sẽ gửi cấu hình mới")
+        self._set_status(f"Selected {name} mode; updated settings will be sent")
 
     def reset_defaults(self):
         for name, _, _, _, default in SLIDERS:
@@ -873,33 +933,33 @@ class ControlPanel:
 
     def restart_esp(self):
         if not self.link.send_raw("RESTART"):
-            self._set_status("Chưa kết nối kênh điều khiển")
+            self._set_status("Control channel is not connected")
             return
-        self._set_status("Đã yêu cầu ESP32 khởi động lại")
+        self._set_status("ESP32 restart requested")
 
     def read_stats(self):
         if not self.link.send_raw("STAT"):
-            self._set_status("Chưa kết nối kênh điều khiển")
+            self._set_status("Control channel is not connected")
             return
-        self._set_status("Đã hỏi trạng thái ESP32...")
+        self._set_status("Requested ESP32 status...")
 
     # ---------- ghi video MP4 ----------
     def toggle_record(self):
         """Bật/tắt ghi video ra thư mục RECORD_DIR."""
         if self.record_writer is not None:
-            self._stop_record("người dùng dừng")
+            self._stop_record("stopped by user")
         else:
             self._start_record()
 
     def _start_record(self):
         if self.last_frame is None:
-            self._set_status("Chưa có frame nào — chưa ghi được video")
+            self._set_status("No frames received — cannot start recording")
             return
         try:
             os.makedirs(RECORD_DIR, exist_ok=True)
         except OSError as exc:
-            self._set_status(f"Không tạo được thư mục {RECORD_DIR}: {exc}")
-            self._log(f"Ghi video: không tạo được thư mục {RECORD_DIR} ({exc})")
+            self._set_status(f"Cannot create folder {RECORD_DIR}: {exc}")
+            self._log(f"Recording: cannot create folder {RECORD_DIR} ({exc})")
             return
 
         try:
@@ -926,15 +986,15 @@ class ControlPanel:
         h, w = self.last_frame.shape[:2]
         if not self._open_writer(w, h):
             return
-        self.record_btn.config(text="■ Dừng ghi")
+        self.record_btn.config(text="■ Stop recording")
         if RECORD_SEGMENT_SECONDS >= 60:
-            seg = f", chia mỗi {RECORD_SEGMENT_SECONDS // 60} phút"
+            seg = f", split every {RECORD_SEGMENT_SECONDS // 60} min"
         elif RECORD_SEGMENT_SECONDS > 0:
-            seg = f", chia mỗi {RECORD_SEGMENT_SECONDS} giây"
+            seg = f", split every {RECORD_SEGMENT_SECONDS} s"
         else:
             seg = ""
-        self._set_status(f"Đang ghi video vào {RECORD_DIR} ({self.record_fps} fps{seg})")
-        self._log(f"Ghi video: {self.record_path} ({w}x{h}, {self.record_fps} fps{seg})")
+        self._set_status(f"Recording to {RECORD_DIR} ({self.record_fps} fps{seg})")
+        self._log(f"Recording: {self.record_path} ({w}x{h}, {self.record_fps} fps{seg})")
 
     def _open_writer(self, w, h):
         """Mở file MP4 mới; trả về True nếu thành công."""
@@ -960,8 +1020,8 @@ class ControlPanel:
 
         self.record_writer = None
         self.record_size = None
-        self._set_status("Không mở được file MP4 (thiếu codec?) — xem ô log")
-        self._log(f"Ghi video: OpenCV không mở được {path} với codec {RECORD_CODECS}")
+        self._set_status("Cannot open MP4 file (missing codec?) — see log")
+        self._log(f"Recording: OpenCV could not open {path} with codecs {RECORD_CODECS}")
         return False
 
     def _record_frame(self, frame):
@@ -979,20 +1039,20 @@ class ControlPanel:
                 frame = cv2.resize(frame, self.record_size,
                                    interpolation=cv2.INTER_AREA)
             except cv2.error as exc:
-                self._log(f"Ghi video: không resize được frame {w}x{h} ({exc})")
+                self._log(f"Recording: could not resize {w}x{h} frame ({exc})")
                 return
             if not self._size_warned:
                 self._size_warned = True
-                self._log(f"Ghi video: frame {w}x{h} khác cỡ file "
+                self._log(f"Recording: {w}x{h} frame differs from file size "
                           f"{self.record_size[0]}x{self.record_size[1]} "
-                          f"-> resize cho khớp (vẫn 1 file)")
+                          f"-> resized to fit (same file)")
         try:
             self.record_writer.write(frame)
             self.record_frames += 1
             self.record_seg_frames += 1
         except cv2.error as exc:
-            self._log(f"Ghi video lỗi: {exc}")
-            self._stop_record("lỗi ghi đĩa")
+            self._log(f"Recording error: {exc}")
+            self._stop_record("disk write error")
             return
 
         # Đủ thời lượng 1 đoạn -> chốt file và mở đoạn mới (không mất toàn bộ
@@ -1010,10 +1070,10 @@ class ControlPanel:
         self.record_part += 1
         self.record_seg_frames = 0
         if not self._open_writer(*size):
-            self._stop_record("không mở được file đoạn mới")
+            self._stop_record("could not open next segment")
             return
-        self._log(f"Ghi video: đủ {RECORD_SEGMENT_SECONDS} s -> đoạn mới "
-                  f"{os.path.basename(self.record_path)} (trước: {prev})")
+        self._log(f"Recording: {RECORD_SEGMENT_SECONDS} s reached -> new segment "
+                  f"{os.path.basename(self.record_path)} (previous: {prev})")
 
     def _close_writer(self):
         if self.record_writer is not None:
@@ -1029,7 +1089,7 @@ class ControlPanel:
         dur = max(0.0, time.time() - self.record_t0) if self.record_t0 else 0.0
         self.record_t0 = 0.0
         try:
-            self.record_btn.config(text="● Ghi MP4")
+            self.record_btn.config(text="● Record MP4")
         except tk.TclError:
             pass
         if not self.record_path:
@@ -1041,14 +1101,14 @@ class ControlPanel:
                 os.remove(self.record_path)
             except OSError:
                 pass
-            self._log(f"Ghi video: không có frame nào ({reason}) -> huỷ file rỗng")
+            self._log(f"Recording: no frames received ({reason}) -> removed empty file")
             self.record_path = ""
             return
 
-        seg_txt = f", {self.record_part} đoạn" if self.record_part > 1 else ""
-        self._set_status(f"Đã lưu {self.record_path} ({self.record_frames} frame, "
+        seg_txt = f", {self.record_part} segments" if self.record_part > 1 else ""
+        self._set_status(f"Saved {self.record_path} ({self.record_frames} frames, "
                          f"~{dur:.0f} s{seg_txt}) — {reason}")
-        self._log(f"Ghi video: lưu {self.record_path} ({self.record_frames} frame, "
+        self._log(f"Recording: saved {self.record_path} ({self.record_frames} frames, "
                   f"~{dur:.0f} s{seg_txt}, {reason})")
         self.record_path = ""
 
@@ -1104,30 +1164,46 @@ class ControlPanel:
 
         fps, exp, rssi = num("fps"), num("exp"), num("rssi")
         length, send, heap = num("len"), num("send"), num("heap")
-        gain = num("gain")
+        gain, maxexp = num("gain"), num("maxexp")
+        txp = num("txp")
 
         notes = []
         if kv.get("cam") == "0":
-            notes.append("CAMERA LỖI/CHƯA KHỞI TẠO — ESP32 tự thử lại mỗi 5 s, "
-                         "kiểm tra cáp camera rồi khởi động lại")
-        if exp >= 1000:
-            notes.append("thiếu sáng nặng: cảm biến phơi sáng ~1 s/frame")
-        elif exp >= 500:
-            notes.append("ánh sáng yếu: phơi sáng dài, FPS thấp là bình thường")
+            notes.append("CAMERA ERROR/NOT INITIALIZED — ESP32 retries every 5 s; "
+                         "check the camera cable and restart")
+        if txp and txp < 80:
+            notes.append("TX power is limited below 20 dBm — check the 5V/2A supply "
+                         "and PHY configuration")
+        if maxexp and exp >= maxexp * 0.95:
+            notes.append("AEC reached the exposure limit — lower FPS (if FPS sets "
+                         "the limit), add light, or reduce resolution")
+        # 1 dòng ≈ HTS/PCLK ≈ 2300/10 MHz ≈ 0,23 ms (khung 4:3 binned).
+        # Trần 2352 dòng ≈ 0,54 s: exposure được phép dài hơn 1 frame.
+        if exp >= 1500:
+            notes.append("very low light: long exposure (~0.35–0.54 s/frame); "
+                         "moving subjects may blur")
+        elif exp >= 600:
+            notes.append("low light: long exposure (~0.14–0.23 s/frame); "
+                         "low FPS is expected")
         if gain >= 480:
-            notes.append("gain rất cao (ảnh dễ hạt) — nên bật nút 'Thiếu sáng' "
-                         "hoặc thêm đèn")
+            notes.append("very high gain (noisy image) — add light or lower "
+                         "'Gain ceiling' for a cleaner image")
         if rssi != 0 and rssi <= -75:
-            notes.append("WiFi yếu, nên lại gần router")
+            notes.append("weak Wi-Fi signal; move closer to the router")
         if send >= 200:
-            notes.append("gửi frame qua mạng chậm")
+            notes.append("slow frame transmission")
+        if length >= 100000:
+            notes.append("very large JPEG frames — increase 'JPEG quality' "
+                         "(higher value) to reduce Wi-Fi load")
 
         tail = ("  → " + "; ".join(notes)) if notes else ""
-        mode = "" if kv.get("stream", "1") == "1" else "  [chờ: không có client → 1 fps]"
-        res = f"  cỡ={kv['res']}" if kv.get("custom") == "1" and "res" in kv else ""
-        return (f"fps={fps:.1f}  exp={int(exp)} dòng  gain={kv.get('gain', '?')}  "
+        mode = "" if kv.get("stream", "1") == "1" else "  [waiting: no client → 1 fps]"
+        res = f"  size={kv['res']}" if kv.get("custom") == "1" and "res" in kv else ""
+        return (f"fps={fps:.1f}  exp={int(exp)}/{int(maxexp) if maxexp else '?'} lines  "
+                f"gain={kv.get('gain', '?')}  "
                 f"len={int(length)} B  send={int(send)} ms  "
-                f"rssi={int(rssi)} dBm  heap={int(heap)} B{res}{tail}{mode}")
+                f"rssi={int(rssi)} dBm  txp={int(txp) // 4 if txp else '?'} dBm  "
+                f"heap={int(heap)} B{res}{tail}{mode}")
 
     def _log(self, text):
         self.info.config(state="normal")
@@ -1160,7 +1236,7 @@ class ControlPanel:
                 self.link.need_sync = False
                 self.apply()
 
-            got = False
+            decoded = 0
             try:
                 while True:
                     data = self.link.frames.get_nowait()
@@ -1168,19 +1244,19 @@ class ControlPanel:
                         np_arr = np.frombuffer(data, dtype=np.uint8)
                         frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
                     except Exception as exc:      # ảnh hỏng/không đủ bộ nhớ
-                        self._log(f"Cảnh báo: giải mã JPEG lỗi ({exc})")
+                        self._log(f"Warning: JPEG decode failed ({exc})")
                         continue
                     if frame is not None:
                         self.last_frame = frame
-                        got = True
+                        decoded += 1       # đếm ĐỦ số frame, không chỉ 1/lần pump
                         self._record_frame(frame)
                     else:
-                        self._log("Cảnh báo: không giải mã được JPEG")
+                        self._log("Warning: could not decode JPEG")
             except queue.Empty:
                 pass
 
-            if got:
-                self.frame_count += 1
+            if decoded:
+                self.frame_count += decoded
                 now = time.time()
                 if now - self._fps_t0 >= 1.0:
                     self.fps_measured = self.frame_count / (now - self._fps_t0)
@@ -1190,23 +1266,29 @@ class ControlPanel:
                     rec = (f" | REC {self.record_frames} frame"
                            if self.record_writer is not None else "")
                     self._log(f"Video {w}x{h} | {self.fps_measured:4.1f} fps | "
-                              f"điều khiển: {'OK' if self.link.ctrl_connected else 'chưa'}"
+                              f"control: {'OK' if self.link.ctrl_connected else 'not connected'}"
                               f"{rec}")
 
-            if self.last_frame is not None:
+            if self._video_window_open:
                 try:
-                    cv2.imshow(VIDEO_WINDOW,
-                               apply_filter(self.last_frame, self.filter_mode))
+                    if cv2.getWindowProperty(
+                            VIDEO_WINDOW, cv2.WND_PROP_VISIBLE) < 1:
+                        self._video_window_open = False
+                    else:
+                        display_frame = (self.last_frame
+                                         if self.last_frame is not None
+                                         else self._waiting_frame)
+                        cv2.imshow(VIDEO_WINDOW,
+                                   apply_filter(display_frame, self.filter_mode))
+                        if cv2.waitKey(1) & 0xFF == ord("q"):
+                            reschedule = False
+                            self.on_close()
                 except cv2.error:
-                    # Người dùng đã đóng cửa sổ video -> tạo lại rồi hiện tiếp
-                    self._reopen_video_window()
-                if cv2.waitKey(1) & 0xFF == ord("q"):
-                    reschedule = False
-                    self.on_close()
+                    self._video_window_open = False
         except Exception as exc:
             # Không để một exception lạ giết vòng lặp: ghi log rồi chạy tiếp
             try:
-                self._log(f"Lỗi vòng cập nhật: {exc}")
+                self._log(f"Update loop error: {exc}")
             except Exception:
                 pass
         finally:
@@ -1216,16 +1298,24 @@ class ControlPanel:
                 except tk.TclError:
                     pass      # cửa sổ Tk đã bị huỷ
 
-    def _reopen_video_window(self):
+    def _open_video_window(self):
+        if self._closing or self._video_window_open:
+            return
         try:
             cv2.namedWindow(VIDEO_WINDOW, cv2.WINDOW_NORMAL)
-        except cv2.error:
-            pass
+            self._video_window_open = True
+            display_frame = (self.last_frame if self.last_frame is not None
+                             else self._waiting_frame)
+            cv2.imshow(VIDEO_WINDOW, display_frame)
+            cv2.waitKey(1)
+        except cv2.error as exc:
+            self._video_window_open = False
+            self._set_status_async(f"Cannot open video window: {exc}")
 
     def on_close(self):
         if self._closing:
             return
-        self._stop_record("đóng chương trình")   # chốt file MP4 trước khi thoát
+        self._stop_record("application closed")   # finalize MP4 before exit
         self._closing = True
         # Huỷ lệnh gửi đang chờ: nếu không, after_cancel sẽ gọi apply() trên
         # widget đã bị destroy -> TclError

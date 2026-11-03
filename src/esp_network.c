@@ -2,6 +2,7 @@
 #include "esp_video_capture.h"
 #include "esp_heap_caps.h"
 #include <stddef.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -13,10 +14,8 @@ static const char *TAG = "NETWORK";
 extern uint8_t *shared_frame_buf;
 extern size_t shared_frame_len;
 extern SemaphoreHandle_t s_frame_mutex;
-extern uint8_t fps;
 
 static EventGroupHandle_t s_wifi_event_group;
-#define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
 
 /* ---- Giám sát rớt WiFi ----
@@ -47,6 +46,41 @@ static const char *wifi_disc_reason_str(uint8_t reason)
     case 204: return "HANDSHAKE_TIMEOUT";
     case 205: return "CONNECTION_FAIL - AP từ chối";
     default:  return "không rõ";
+    }
+}
+
+/* ================= CÔNG SUẤT PHÁT TỐI ĐA =================
+ * esp_wifi_set_max_tx_power() dùng đơn vị 0.25 dBm: 80 = 20 dBm.
+ * sdkconfig.esp32cam đã có CONFIG_ESP_PHY_MAX_WIFI_TX_POWER=20 và
+ * CONFIG_ESP_PHY_REDUCE_TX_POWER đang tắt, nên 20 dBm là mức cao nhất mà
+ * phần cứng/PHY cho phép — đặt cao hơn sẽ bị kẹp về 20 dBm.
+ *
+ * Hàm này đặt rồi ĐỌC LẠI để xác nhận. Gọi sau esp_wifi_start() và gọi lại
+ * mỗi khi kết nối lại (một số bản IDF điều chỉnh công suất theo tốc độ sau
+ * khi connect xong). Lưu ý: công suất phát tối đa chỉ có ích khi nguồn 5 V
+ * đủ khỏe; nguồn yếu làm sụt áp và giảm công suất RF thực tế. */
+#define WIFI_MAX_TX_POWER_QDBM 80
+#define WIFI_TX_POWER_IS_MAX(qdbm) ((qdbm) >= WIFI_MAX_TX_POWER_QDBM)
+
+static void wifi_apply_max_tx_power(void)
+{
+    esp_err_t err = esp_wifi_set_max_tx_power(WIFI_MAX_TX_POWER_QDBM);
+    int8_t actual = 0;
+    if (err == ESP_OK)
+        err = esp_wifi_get_max_tx_power(&actual);
+
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "TX power: loi %s", esp_err_to_name(err));
+        return;
+    }
+
+    if (WIFI_TX_POWER_IS_MAX(actual)) {
+        ESP_LOGI(TAG, "TX power toi da: %d (0.25 dBm/don vi) = %d dBm",
+                 (int)actual, (int)actual / 4);
+    } else {
+        ESP_LOGW(TAG, "TX power bi gioi han: %d (0.25 dBm/don vi) < %d "
+                      "-> kiem tra nguon 5V/2A, antenna, CONFIG_ESP_PHY_*",
+                 (int)actual, WIFI_MAX_TX_POWER_QDBM);
     }
 }
 
@@ -85,6 +119,9 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
         s_retry_num = 0;
         s_wifi_ever_connected = true;   // đã từng kết nối -> bật cơ chế tự reboot
         s_wifi_link_up = true;
+        /* Đặt lại công suất phát tối đa sau khi bắt tay xong: một số bản IDF
+         * điều chỉnh mức phát theo rate/điều kiện kênh sau khi connect. */
+        wifi_apply_max_tx_power();
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }
     else if (event_id == WIFI_EVENT_AP_STACONNECTED)
@@ -152,7 +189,7 @@ void wifi_init_softap(void)
     // Áp dụng cấu hình IP tĩnh vào hệ thống
     ESP_ERROR_CHECK(esp_netif_set_ip_info(ap_netif, &ip_info));
 
-    // 4. KHỞI ĐỘNG LẠI DHCP Server để nó tự động cấp IP cho các thiết bị bắt vào (Dải 192.168.5.x)
+    // 4. KHỞI ĐỘNG LẠI DHCP Server để nó tự động cấp IP cho các thiết bị bắt vào (dải 192.168.9.x)
     ESP_ERROR_CHECK(esp_netif_dhcps_start(ap_netif));
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
@@ -181,6 +218,7 @@ void wifi_init_softap(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
+    wifi_apply_max_tx_power();          // AP cũng phát ở công suất tối đa
 
     // In thông tin IP tĩnh của Host ra UART
     esp_netif_get_ip_info(ap_netif, &ip_info);
@@ -300,7 +338,17 @@ void wifi_init_sta(void)
     ESP_ERROR_CHECK(esp_wifi_start());
 
     // Tắt power saving để tăng độ ổn định kết nối
-    esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
+    esp_wifi_set_ps(WIFI_PS_NONE);
+
+    /* Cấu hình PHY một lần lúc khởi động (KHÔNG gọi trong vòng lặp gửi frame):
+     * - TX power tối đa 20 dBm (80 x 0.25 dBm), có đọc lại xác nhận
+     *   (wifi_apply_max_tx_power()).
+     * - Ép băng thông 20 MHz: ổn định hơn 40 MHz khi tín hiệu yếu/nhiều nhiễu,
+     *   đúng với nhu cầu stream MJPEG (không cần throughput đỉnh).
+     * Trước đây TX power được đặt trong video_stream_task mỗi lần discovery;
+     * đặt ở đây vừa đủ và tránh ghi lại thanh ghi PHY lặp lại. */
+    wifi_apply_max_tx_power();
+    esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20);
 
     // Giám sát rớt WiFi: đã từng kết nối mà mất > 5 s -> reboot (xem wifi_guard_task)
     if (xTaskCreate(wifi_guard_task, "wifi_guard", 3072, NULL, 3, NULL) != pdPASS) {
@@ -558,7 +606,12 @@ static bool ctrl_apply_cfg(char *line, bool *need_restart)
 
 /* Gửi đủ len byte. send() trên socket block có thể trả về THIẾU byte khi WiFi
  * chậm; trước đây header 4 byte có thể chỉ đi 1-2 byte làm lệch hoàn toàn bộ
- * đếm frame phía client. Trả 0 nếu đủ, -1 nếu lỗi/timeout. */
+ * đếm frame phía client. Trả 0 nếu đủ, -1 nếu lỗi/timeout.
+ *
+ * Lưu ý: KHÔNG thử lại sau khi send() trả -1. lwIP có thể đã nhận một phần dữ
+ * liệu rồi mới timeout (lwip_send trả -1 dù đã ghi một phần), nên gửi lại từ
+ * vị trí cũ sẽ nhân đôi byte và làm hỏng JPEG. Cách an toàn là đóng kết nối để
+ * client nối lại (frame dở bị bỏ, frame sau nguyên vẹn). */
 static int send_all(int sock, const void *buf, size_t len)
 {
     const uint8_t *p = (const uint8_t *)buf;
@@ -570,6 +623,25 @@ static int send_all(int sock, const void *buf, size_t len)
         done += (size_t)n;
     }
     return 0;
+}
+
+/* ================= TỐI ƯU SOCKET VIDEO CHO TÍN HIỆU YẾU =================
+ * - TCP_NODELAY: đẩy header + payload đi ngay, không chờ Nagle gom gói.
+ * - SO_KEEPALIVE: phát hiện peer đã chết mà không phải chờ ghi timeout.
+ * - SO_SNDTIMEO 10 s (mặc định 3 s): khi WiFi yếu, vài chục KB/s vẫn là kết
+ *   nối sống; 3 s dễ làm send() timeout giữa frame và ngắt kết nối oan. Chỉ
+ *   khi không nhích được byte nào trong 10 s mới coi là đứt và nối lại.
+ * Buffer TCP lớn hơn được đặt trong sdkconfig.esp32cam
+ * (CONFIG_LWIP_TCP_SND_BUF_DEFAULT / WND_DEFAULT) — đó là yếu tố quyết định
+ * thông lượng trên link có RTT cao/nhiều retransmit. */
+static void video_socket_tune(int sock)
+{
+    int one = 1;
+    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+
+    struct timeval tv = { .tv_sec = 10, .tv_usec = 0 };
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 }
 
 static void ctrl_send_str(int sock, const char *msg)
@@ -592,16 +664,21 @@ static void ctrl_send_stats(int sock)
     if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK)
         rssi = ap.rssi;
 
+    /* Công suất phát đang cấu hình (0.25 dBm/đơn vị; 80 = 20 dBm). */
+    int8_t txp = 0;
+    if (esp_wifi_get_max_tx_power(&txp) != ESP_OK)
+        txp = 0;
+
     char buf[300];
     snprintf(buf, sizeof(buf),
-             "STAT fps=%u.%u frames=%u bad=%u len=%u exp=%d gain=%d ae=%d send=%ums "
-             "fs=%d q=%d gc=%d res=%dx%d custom=%d cam=%d rssi=%d heap=%u min=%u psram=%u stream=%d\n",
+             "STAT fps=%u.%u frames=%u bad=%u len=%u exp=%d maxexp=%d gain=%d ae=%d send=%ums "
+             "fs=%d q=%d gc=%d res=%dx%d custom=%d cam=%d rssi=%d txp=%d heap=%u min=%u psram=%u stream=%d\n",
              (unsigned)(st.fps_x10 / 10), (unsigned)(st.fps_x10 % 10),
              (unsigned)st.frames, (unsigned)st.invalid, (unsigned)st.last_len,
-             st.exposure, st.gain, st.ae_manual,
+             st.exposure, st.aec_max, st.gain, st.ae_manual,
              (unsigned)s_last_send_ms, cfg.framesize, cfg.quality, cfg.gainceiling,
              st.out_w, st.out_h, cfg.custom, camera_is_ready() ? 1 : 0,
-             rssi, (unsigned)st.heap_free, (unsigned)st.heap_min,
+             rssi, (int)txp, (unsigned)st.heap_free, (unsigned)st.heap_min,
              (unsigned)st.psram_free, camera_stream_active() ? 1 : 0);
     ctrl_send_str(sock, buf);
 }
@@ -747,10 +824,11 @@ void video_stream_task(void *pvParameters)
             continue;
         }
 
-        esp_wifi_set_max_tx_power(80); // Set max TX power to 80 (0-82 range for ESP32)
         dest_addr.sin_addr.s_addr = target_ip.addr;
 
-        // Set Send and Receive timeouts to 3 seconds to prevent permanent hanging
+        // Timeout 3 s cho bắt tay/đăng nhập để không treo vĩnh viễn.
+        // Sau khi xác thực, socket video được nâng lên 10 s (video_socket_tune)
+        // vì frame lớn gửi qua WiFi yếu có thể cần nhiều thời gian hơn.
         struct timeval timeout;
         timeout.tv_sec = 3;
         timeout.tv_usec = 0;
@@ -800,6 +878,7 @@ void video_stream_task(void *pvParameters)
             {
                 // Mật khẩu đúng -> Phản hồi tín hiệu xanh cho Python chuyển trạng thái
                 send_all(sock, "AUTH_OK\n", 8);
+                video_socket_tune(sock);   // buffer/timeout phù hợp link yếu
                 ESP_LOGI(TAG, "Authentication SUCCESSFUL!");
 
                 // 2. MỞ KÊNH ĐIỀU KHIỂN RIÊNG (TCP 1358) ĐỂ CHỈNH THÔNG SỐ CAMERA
@@ -810,7 +889,7 @@ void video_stream_task(void *pvParameters)
 
             ESP_LOGI(TAG, "Authentication SUCCESSFUL! Initiating video stream from shared_frame_buf.");
 
-            // Có client -> capture chạy đúng FPS đặt trên UI (mặc định 20)
+            // Có client -> capture chạy đúng FPS đặt trên UI (mặc định 10)
             camera_set_stream_active(true);
 
             // --- STEP 2: VIDEO STREAM LOOP FROM SHARED MEMORY BUFFER ---
@@ -904,8 +983,8 @@ void video_stream_task(void *pvParameters)
                 // Lỗi truyền -> thoát vòng stream để kết nối lại
                 if (err < 0 || bytes_sent < image_len)
                 {
-                    ESP_LOGE(TAG, "Stream send failed (%u/%u bytes). Reconnecting...",
-                             (unsigned)bytes_sent, (unsigned)image_len);
+                    ESP_LOGE(TAG, "Stream send failed (%u/%u bytes, errno=%d). Reconnecting...",
+                             (unsigned)bytes_sent, (unsigned)image_len, errno);
                     break;
                 }
 
